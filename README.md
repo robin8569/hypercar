@@ -1,6 +1,6 @@
 # HyperCar
 
-让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI** 和 **小米 CarWith** 两种画面来源，无需 root。
+让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI** 和 **小米 CarWith** OPPO Car+ 三种画面来源，无需 root。
 
 [下载 APK](https://github.com/fw867/hypercar/releases/latest) · [使用与开发文档](docs/README.md) · [验证范围](docs/VALIDATION.md) · [反馈问题](https://github.com/fw867/hypercar/issues)
 
