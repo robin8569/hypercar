@@ -1738,6 +1738,7 @@ fun CarSourceSection(
         if (connected) return
         if (source == "car_ui" && !ShizukuTools.isReady) return
         if (source == "carwith" && !io.github.hypercar.session.StartupRequirements.carWithInstalled(ctx)) return
+        if (source == "carplus" && !io.github.hypercar.session.StartupRequirements.carPlusInstalled(ctx)) return
         SettingsStore.carSource = source
         io.github.hypercar.settings.SettingsRevision.bump()
         HyperCarRepo.log("STARTUP: 画面来源=$source，重新检查启动条件")
@@ -1747,13 +1748,22 @@ fun CarSourceSection(
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = title)
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+                val sources = listOf(
+                    "car_ui" to "自绘 UI",
+                    "carwith" to "CarWith",
+                    "carplus" to "Car+ 车联",
+                )
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    listOf("car_ui" to "自绘车机 UI", "carwith" to "CarWith").forEachIndexed { index, (source, label) ->
+                    sources.forEachIndexed { index, (source, label) ->
                         SegmentedButton(
                             selected = current == source,
-                            enabled = !connected && if (source == "car_ui") startup.shizukuReady else startup.carWithInstalled,
+                            enabled = !connected && when (source) {
+                                "car_ui" -> startup.shizukuReady
+                                "carwith" -> startup.carWithInstalled
+                                else -> startup.carPlusInstalled
+                            },
                             onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = sources.size),
                             label = { Text(label, style = MaterialTheme.typography.labelMedium) },
                         )
                     }
@@ -1762,6 +1772,7 @@ fun CarSourceSection(
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
+                    current == "carplus" -> "Car+ 车联与 CarWith 共用同一套 CarLife 转发；入口按包名与 Activity 自动探测，细节见日志 CARPLUS 行。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
                 }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
@@ -1769,7 +1780,11 @@ fun CarSourceSection(
                     CarWithSettingsShortcut()
                 }
                 if (!startup.carWithInstalled) {
-                    Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
+                    Text("未安装系统 CarWith，CarWith 选项不可用。", color = AmberWarning,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                if (!startup.carPlusInstalled) {
+                    Text("未检测到 Car+ 车联（com.oplus.ocar），Car+ 选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
                 }
             }
@@ -1831,6 +1846,48 @@ fun CarSourceSection(
                 modifier = Modifier.fillMaxWidth(), filled = current == "carwith")
             if (startup.carWithInstalled) {
                 CarWithSettingsShortcut()
+            }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            Text("Car+ 车联模式（OPPO）", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text(if (startup.carPlusInstalled)
+                "已检测到 ${startup.carPlusPackage ?: "Car+ 车联"}。与 CarWith 共用同一套本机 CarLife 桥，只换拉起对象；入口按包名与 Activity 自动探测。"
+            else "未检测到 Car+ 车联（com.oplus.ocar / com.oplus.carplus 等），当前设备无法选择此模式。",
+                color = if (startup.carPlusInstalled) TextSecondary else AmberWarning,
+                style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            CapsuleButton(if (current == "carplus") "已选择 Car+ 车联" else "选择 Car+ 车联",
+                onClick = { selectSource("carplus") }, enabled = !connected && startup.carPlusInstalled,
+                modifier = Modifier.fillMaxWidth(), filled = current == "carplus")
+            if (startup.carPlusInstalled) {
+                var entryText by rememberSaveable { mutableStateOf(SettingsStore.carPlusComponent ?: "") }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = entryText,
+                        onValueChange = { entryText = it.take(180) },
+                        label = { Text("入口 包名/Activity（留空=自动探测）", style = MaterialTheme.typography.labelMedium) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = {
+                            SettingsStore.carPlusComponent = entryText
+                            HyperCarRepo.log("STARTUP: Car+ 入口=${SettingsStore.carPlusComponent ?: "auto"}")
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text("保存", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+                Text(if (SettingsStore.carPlusComponent == null)
+                    "当前：自动探测，诊断日志的 CARPLUS: 行会列出候选 Activity"
+                else "当前：${SettingsStore.carPlusComponent}",
+                    color = TextSecondary, style = MaterialTheme.typography.labelSmall)
             }
             if (!compact) {
                 Spacer(Modifier.height(8.dp))

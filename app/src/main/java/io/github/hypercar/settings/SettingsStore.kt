@@ -52,6 +52,7 @@ object SettingsStore {
     private const val KEY_LAST_AIRPLAY_ENDPOINT = "last_airplay_endpoint"
     private const val KEY_PAIRING_IDENTITY = "pairing_identity"
     private const val KEY_PAIRED_CARS = "paired_cars"
+    private const val KEY_CARPLUS_COMPONENT = "carplus_entry_component"
 
     /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
 
@@ -310,6 +311,8 @@ object SettingsStore {
      *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
      *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
      *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
+     *  · "carplus"  —— 走 OPPO Car+ 车联（2026-11-23）：同样是 CarLife 手机端，自己建屏/编码
+     *                 并开本机七通道，区别只在拉起谁的入口；协议层与 CarWith 完全共用
      */
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
@@ -318,8 +321,21 @@ object SettingsStore {
     /** Existing explicit choices survive upgrades; fresh installs must choose a source. */
     val carSourceSelected: Boolean get() = p().contains("car_source")
 
-    /** 是否 CarWith 模式。 */
-    val carWithMode: Boolean get() = carSource == "carwith"
+    /** 是否走本机 CarLife 桥（CarWith 与 Car+ 车联共用同一套七通道桥）。 */
+    val carWithMode: Boolean get() = carSource == "carwith" || carSource == "carplus"
+
+    /** 是否 OPPO Car+ 车联源。 */
+    val carPlusMode: Boolean get() = carSource == "carplus"
+
+    /**
+     * Car+ 车联入口组件覆盖（`包名/Activity`）；空 = 按包名候选 + Activity 关键字自动探测。
+     *
+     * Car+ 车联没有公开的调试入口，自动探测只在“候选里挑一个能启动的 Activity”，
+     * 真机若拉起后 7240 一直 refused，就把探测日志里列出的 Activity 填到这里。
+     */
+    var carPlusComponent: String?
+        get() = p().getString(KEY_CARPLUS_COMPONENT, null)?.trim()?.takeIf { it.contains('/') }
+        set(v) = p().edit().putString(KEY_CARPLUS_COMPONENT, v?.trim()?.takeIf { it.contains('/') }).apply()
 
     // The retired self-rendered speech experiment also gates incoming native callbacks.
     val carVoiceRecognition: Boolean get() = false

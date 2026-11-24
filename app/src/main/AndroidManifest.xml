@@ -57,10 +57,16 @@
         android:name="android.hardware.wifi"
         android:required="true" />
 
-    <!-- Android 11+ 包可见性：Shizuku 服务端 + 车机首页要拉起的地图/音乐 App。 -->
+    <!-- Android 11+ 包可见性：Shizuku 服务端 + 车机首页要拉起的地图/音乐 App +
+         CarLife 画面源（小米 CarWith / OPPO Car+ 车联）。 -->
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <package android:name="com.miui.carlink" />
+        <package android:name="com.oplus.ocar" />
+        <package android:name="com.oplus.carplus" />
+        <package android:name="com.coloros.carplus" />
+        <package android:name="com.oplus.carlink" />
+        <package android:name="com.coloros.carlink" />
         <package android:name="com.miui.voiceassist" />
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="com.autonavi.minimap" />

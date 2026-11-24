@@ -9,6 +9,8 @@ data class StartupReadiness(
     val locationEnabled: Boolean = true,
     val shizukuReady: Boolean = false,
     val carWithInstalled: Boolean = false,
+    val carPlusInstalled: Boolean = false,
+    val carPlusPackage: String? = null,
     val overlayAllowed: Boolean = false,
 ) {
     val manualIssues: List<String> get() = buildList {
@@ -19,6 +21,7 @@ data class StartupReadiness(
         when (source) {
             "car_ui" -> if (!shizukuReady) add("安装、启动 Shizuku 并授权 HyperCar")
             "carwith" -> if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
+            "carplus" -> if (!carPlusInstalled) add("安装并启用 Car+ 车联（com.oplus.ocar）")
             else -> add("选择车机画面来源")
         }
     }

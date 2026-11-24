@@ -257,6 +257,18 @@ object HyperCarRepo {
     private var reconnectJob: Job? = null
     private var sessionUiJob: Job? = null
     @Volatile private var sessionCarWithMode = false
+
+    /**
+     * CarLife 源端 App（CarWith / Car+ 车联）的“待拉起”动作。
+     *
+     * 2026-11-23：源端 App 不在本轮开始时拉起，而是等车机 AirPlay 真正连上（引擎上报
+     * `connected` = CONTROL_READY）之后再拉起——否则手机在车机还没连上时就把
+     * CarLife 画面推到前台。七通道守候服务照旧在开始时准备好，它自己会重试 7240。
+     */
+    @Volatile private var pendingCarSourceLaunch: (() -> Unit)? = null
+
+    /** 本轮是否已经拉起过源端 App（引擎可能重复上报 connected，只能拉起一次）。 */
+    private val carSourceLaunchStarted = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
     private val automaticModeRequest = AtomicLong()
@@ -780,7 +792,11 @@ object HyperCarRepo {
         aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
         val moving = discoveryHandoff?.takeIf { source == "manual-retry" && it.successor == null }
         aclEdge?.ticket?.assign(connectionAttemptId)
-        if (sessionCarWithMode) carWithEntries.begin(connectionAttemptId)
+        if (sessionCarWithMode) {
+            carWithEntries.begin(connectionAttemptId)
+            pendingCarSourceLaunch = null
+            carSourceLaunchStarted.set(false)
+        }
         sessionLive.set(true)
         // Readers that observe the published successor must also see its live flag and ID.
         discoveryHandoff = moving?.let { DiscoverabilityHandoff(it.origin, connectionAttemptId) }
@@ -3001,6 +3017,18 @@ object HyperCarRepo {
                     MusicBridge.onCarConnected(callbackOwner)
                     streaming = true
                     sessionHadLink = true
+                    // CarPlay 已经连上（控制通道就绪）——源端 CarLife App 现在才拉起：
+                    // 之前是连接前就 am start，手机会在车机没连上时提前弹出 CarLife 画面。
+                    if (sessionCarWithMode) {
+                        val launch = pendingCarSourceLaunch
+                        pendingCarSourceLaunch = null
+                        if (launch != null && carSourceLaunchStarted.compareAndSet(false, true)) {
+                            log("${
+                                if (SettingsStore.carPlusMode) "CARPLUS" else "CARWITH"
+                            }: CarPlay 已连上（CONTROL_READY）；现在拉起源端 App attempt=$diagnosticId")
+                            launch()
+                        }
+                    }
                     // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
                     // 蓝牙已配对 ≠ CarPlay 配对过：只有会话真正激活（RECORD 完成）才算。
                     runCatching {
@@ -3091,13 +3119,23 @@ object HyperCarRepo {
         }
 
         override fun onCarWithReopen(attempt: Long, startup: Boolean) {
+            // 源端 App 已改为「CarPlay 连上后才拉起」：连上之前 7240 一直拒绝是预期现象，
+            // 引擎据此请求重开源端时不能真的把 CarLife 弹到前台。
+            if (!streaming) {
+                log("CARWITH-START: 引擎请求重开源端（startup=$startup），但 CarPlay 尚未连上，" +
+                    "按新策略不拉起 attempt=$attempt")
+                return
+            }
             if (!carWithEntries.claimReopen(attempt, startup)) return
             scope.launch {
                 val ctx = appContext() ?: return@launch
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
+                val carPlus = SettingsStore.carPlusMode
+                val tag = if (carPlus) "CARPLUS" else "CARWITH"
                 val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
-                log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
-                log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
+                log("$tag-START: $reason，重新启动本机源端入口 attempt=$attempt")
+                val result = if (carPlus) launchCarPlus(ctx, attempt) else launchCarWith(ctx, attempt)
+                log("$tag-START: attempt=$attempt $result")
             }
         }
 
@@ -4023,6 +4061,9 @@ object HyperCarRepo {
     private fun prepareCarWithSource(context: Context, diagnosticId: Long, deviceMac: String, wakePeer: String?): Boolean {
         fun current() = sessionLive.get() && carWithEntries.current(diagnosticId)
         if (!current()) return false
+        // 两个 CarLife 源共用同一套七通道桥，只有“拉起谁”不同。
+        val carPlus = SettingsStore.carPlusMode
+        val tag = if (carPlus) "CARPLUS" else "CARWITH"
         // Known-Wi-Fi wakes run before resumeKnownCarNetwork populates wifiReceiverMac.
         val profile = headUnitProfile.id
         val key = PairingEvidence.canvasKey(profile, iap2?.activePeerAddress,
@@ -4036,40 +4077,60 @@ object HyperCarRepo {
             carWithSource = true)).put("width", canvas.first).put("height", canvas.second)
             .put("carwith_cached_canvas", cached != null)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
-        log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +
+        log("$tag: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +
             when { cached != null -> "hit"; key != null -> "miss"; else -> "no_identity" })
         if (!RustCoreBridge.nativePrepareCarWith(config, diagnosticId)) return false
         if (!current()) {
             RustCoreBridge.nativeStopCarWith(diagnosticId)
             return false
         }
+        // 只准备七通道守候；源端 App 的入口留到「CarPlay 已连上」那一刻再拉起。
+        pendingCarSourceLaunch = { launchCarSourceApp(context, diagnosticId) }
+        carSourceLaunchStarted.set(false)
+        log("$tag: 七路守候与接收服务就绪；源端 App 延迟到 CarPlay 连上后再拉起 attempt=$diagnosticId")
+        return true
+    }
+
+    /**
+     * 拉起 CarLife 源端 App（CarWith 或 Car+ 车联），并做启动后取证。
+     *
+     * 只应在车机 AirPlay 已经连上之后调用（见 onState 的 `connected` 分支），
+     * 避免车机还没连上时手机就把 CarLife 画面推到前台。
+     */
+    private fun launchCarSourceApp(context: android.content.Context, diagnosticId: Long) {
+        fun current() = sessionLive.get() && carWithEntries.current(diagnosticId)
+        if (!current()) return
+        val carPlus = SettingsStore.carPlusMode
+        val tag = if (carPlus) "CARPLUS" else "CARWITH"
         sessionUiJob?.cancel()
         sessionUiJob = scope.launch {
             try {
                 CarUiCaster.releaseForCarWith()
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!current()) return@launch
-                log("CARWITH: 七路守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
+                log("$tag: 启动源端 attempt=$diagnosticId（CarPlay 已连上）")
                 val launchTime = System.currentTimeMillis()
-                val result = launchCarWith(context, diagnosticId)
+                val result = if (carPlus) launchCarPlus(context, diagnosticId)
+                    else launchCarWith(context, diagnosticId)
                 if (!current()) return@launch
+                val pkg = if (carPlus) CarPlusSource.installedPackage(context) ?: "com.oplus.ocar"
+                    else StartupRequirements.CARWITH_PACKAGE
                 val version = runCatching {
-                    context.packageManager.getPackageInfo("com.miui.carlink", 0).let { "${it.versionName}/${it.longVersionCode}" }
+                    context.packageManager.getPackageInfo(pkg, 0).let { "${it.versionName}/${it.longVersionCode}" }
                 }.getOrDefault("unknown")
-                log("CARWITH-START: attempt=$diagnosticId version=$version $result")
+                log("$tag-START: attempt=$diagnosticId version=$version $result")
                 kotlinx.coroutines.delay(6_000)
                 if (current()) CarWithStartupDiagnostics.collect(launchTime) { evidence ->
-                    if (current()) log("CARWITH-START: attempt=$diagnosticId $evidence")
+                    if (current()) log("$tag-START: attempt=$diagnosticId $evidence")
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (current()) log("CARWITH: 源端准备失败：${error.message}")
+                if (current()) log("$tag: 源端准备失败：${error.message}")
             } finally {
                 if (!current()) RustCoreBridge.nativeStopCarWith(diagnosticId)
             }
         }
-        return true
     }
 
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
@@ -4106,5 +4167,78 @@ object HyperCarRepo {
             }.getOrElse { "；startActivity($comp) 失败 ${it.javaClass.simpleName}" }
         })
         return if (launched) shellStatus else "已跳过过期 CarWith 启动 attempt=$attempt"
+    }
+
+    /**
+     * OPPO「Car+ 车联」入口（2026-11-23）。
+     *
+     * 与 [launchCarWith] 同一思路：拉起 Car+ 车联后由它自己建屏/编码，并在本机开
+     * 7240/8240/9240/9340……；Rust 引擎随即以车机身份拨号接管，协议层完全复用。
+     *
+     * 差别只有入口：Car+ 车联没有公开的 `CarlifeAdbActivity` 一类文档，所以这里按
+     * [CarPlusSource] 的包名候选 + Activity 打分挑选，并把候选全部写进 `CARPLUS:` 日志；
+     * 设置里的 `包名/Activity` 可覆盖自动结果。入口只能拉起普通首页时，7240 不会监听。
+     */
+    private suspend fun launchCarPlus(ctx: android.content.Context, attempt: Long): String {
+        val pkg = CarPlusSource.installedPackage(ctx)
+            ?: return "未安装 Car+ 车联（候选 ${CarPlusSource.PACKAGES.joinToString("/")}）"
+        log("CARPLUS: ${CarPlusSource.describe(ctx, pkg)}")
+        log("CARPLUS: ${CarPlusSource.packageSnapshot()}")
+        SettingsStore.carPlusComponent?.let { override ->
+            val component = CarPlusSource.resolve(ctx, pkg, override)
+                ?: return "pkg=$pkg 未解析到可启动的 Activity（override=$override）"
+            log("CARPLUS: 入口 ${component.flattenToShortString()} override=$override")
+            val status = launchCarPlusComponent(ctx, attempt, component)
+            return if (carWithEntries.current(attempt)) status else "已跳过过期 Car+ 启动 attempt=$attempt"
+        }
+        // 未指定入口：按分数逐个试。CarlifeActivity 这类主投屏页可能还要“已连接配件”才开会话，
+        // 因此以 7240 是否进入 LISTEN 为准；命中就记住该组件，下次直接启动。
+        val sweep = CarPlusSource.sweepList(ctx, pkg)
+        if (sweep.isEmpty()) return "pkg=$pkg 没有可启动的导出 Activity"
+        log("CARPLUS: 未指定入口，开始候选扫描（${sweep.size} 个，各等 3s 看 7240）")
+        for ((index, candidate) in sweep.withIndex()) {
+            if (!carWithEntries.current(attempt)) return "已跳过过期 Car+ 扫描 attempt=$attempt"
+            val component = android.content.ComponentName(pkg, candidate.className)
+            val status = launchCarPlusComponent(ctx, attempt, component)
+            kotlinx.coroutines.delay(3_000)
+            if (!carWithEntries.current(attempt)) return "已跳过过期 Car+ 扫描 attempt=$attempt"
+            val listen = CarPlusSource.listeningOn7240()
+            log("CARPLUS-SWEEP: try=${index + 1}/${sweep.size} " +
+                "${component.flattenToShortString()} listen=${listen?.toString() ?: "unknown"} $status")
+            if (listen == true) {
+                SettingsStore.carPlusComponent = component.flattenToString()
+                log("CARPLUS-SWEEP: 命中并记住入口 ${component.flattenToShortString()}")
+                return "sweep hit ${component.flattenToShortString()}"
+            }
+        }
+        return "候选扫描结束（${sweep.size} 个），7240 未进入 LISTEN"
+    }
+
+    /** 启动单个 Car+ 组件：优先 Shizuku `am start`，失败再走普通 startActivity。 */
+    private suspend fun launchCarPlusComponent(
+        ctx: android.content.Context,
+        attempt: Long,
+        component: android.content.ComponentName,
+    ): String {
+        var shellStatus = "Shizuku 未就绪"
+        carWithEntries.launch(attempt, shell = {
+            if (!ShizukuTools.isReady) return@launch false
+            val result = runCatching {
+                ShizukuTools.exec("am start -n ${component.flattenToString()}", 8_000) {
+                    carWithEntries.current(attempt)
+                }
+            }.getOrNull()
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            shellStatus = result?.let {
+                "am start exit=${it.code} ${it.out.take(160).trim()} ${it.err.take(160).trim()}"
+            } ?: "am start 未取得结果"
+            result?.ok == true
+        }, fallback = {
+            shellStatus += runCatching {
+                ctx.startActivity(CarPlusSource.intentFor(component))
+                "；startActivity 已调用"
+            }.getOrElse { "；startActivity 失败 ${it.javaClass.simpleName}" }
+        })
+        return shellStatus
     }
 }

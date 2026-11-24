@@ -1,6 +1,6 @@
 # HyperCar
 
-让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI** 和 **小米 CarWith** 两种画面来源，无需 root。
+让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI**、**小米 CarWith** 与 **OPPO Car+ 车联** 三种画面来源，无需 root。
 
 [下载 APK](https://github.com/fw867/hypercar/releases/latest) · [使用与开发文档](docs/README.md) · [验证范围](docs/VALIDATION.md) · [反馈问题](https://github.com/fw867/hypercar/issues)
 
@@ -8,7 +8,7 @@
 
 ## 主要功能
 
-- **两种画面来源**：自绘 UI 提供地图、音乐卡片与 Dock；CarWith 模式转发系统 CarWith 的界面与音频。
+- **三种画面来源**：自绘 UI 提供地图、音乐卡片与 Dock；CarWith 模式转发系统 CarWith 的界面与音频；Car+ 车联模式转发 OPPO Car+ 车联的界面与音频（与 CarWith 共用同一套本机 CarLife 桥）。
 - **地图与导航**：自绘 UI 支持已安装的高德、百度地图；首页卡片可触摸拖动，通过 Dock 地图图标进入全屏。卡片与全屏复用地图任务，短时断开保留地图进程；高德结构化数据可用于卡片导航提示。
 - **音乐控制**：显示播放器提供的专辑封面、播放状态，支持播放/暂停、切歌及播放器允许的收藏操作，也可打开播放器界面。可选择默认音乐 App 和连接自动播放。
 - **声音转发**：提供「自动」「PCM」「AAC 优先」，CarWith 与自绘 UI 共用输出链路。AAC和缓冲音频需接收端声明支持。
@@ -44,6 +44,7 @@
 |---|---|---|
 | **自绘车机 UI** | 安装、启动 Shizuku，并成功授权 HyperCar；安装所需地图和音乐 App | HyperCar 渲染首页；车机内可设置默认地图、音乐、自动播放、日夜主题与壁纸 |
 | **CarWith** | 系统已安装并启用小米 CarWith（`com.miui.carlink`） | 使用 CarWith 自身界面，HyperCar 自动适配车机屏幕，无需手动设置分辨率。无需 Shizuku；未授权时，首次加入车机 Wi-Fi 或手动连接请求开启蓝牙可发现，可能需要按系统提示确认 |
+| **Car+ 车联** | 系统已安装并启用 OPPO Car+ 车联（`com.oplus.ocar`，旧版本也可能为 `com.oplus.carplus`） | 与 CarWith 共用同一套本机 CarLife 桥与屏幕适配，只替换拉起对象。入口按包名 + Activity 自动探测，诊断日志 `CARPLUS:` 行会列出候选；入口尚未实车确认，详见[说明](docs/CARPLUS-SOURCE.md) |
 
 CarWith 是否可用取决于系统是否提供该组件，不仅取决于手机品牌。部分静默入网、蓝牙回连辅助仍依赖 Shizuku 或系统授权。
 
@@ -113,7 +114,7 @@ pwsh -File tools\build-local.ps1
 pwsh -File tools\build-local.ps1 -SkipRust
 ```
 
-正式签名、版本号、测试和安装见[构建说明](docs/BUILD.md)。CarWith 的 CarLife 通道、认证及加密流程见[画面来源说明](docs/CARWITH-SOURCE.md)。
+正式签名、版本号、测试和安装见[构建说明](docs/BUILD.md)。CarWith 的 CarLife 通道、认证及加密流程见[画面来源说明](docs/CARWITH-SOURCE.md)。OPPO Car+ 车联的入口探测与判定见[Car+ 车联源](docs/CARPLUS-SOURCE.md)。
 
 | 目录 | 内容 |
 |---|---|

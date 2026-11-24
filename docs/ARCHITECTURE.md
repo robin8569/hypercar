@@ -2,7 +2,7 @@
 
 更新：2026-11-07。
 
-HyperCar 是无线 CarPlay 的手机内容源：通过经典蓝牙 iAP2 协商车机 Wi-Fi，再通过 AirPlay 传送自绘界面与系统音频。默认链路不依赖 CarLife、CarWith 或 PC hub，不要求 root。可选的 [CarWith 画面源](CARWITH-SOURCE.md) 依赖手机上对应小米组件，使用独立的本机 CarLife 桥。
+HyperCar 是无线 CarPlay 的手机内容源：通过经典蓝牙 iAP2 协商车机 Wi-Fi，再通过 AirPlay 传送自绘界面与系统音频。默认链路不依赖 CarLife、CarWith 或 PC hub，不要求 root。可选的 [CarWith 画面源](CARWITH-SOURCE.md) 依赖手机上对应小米组件，使用独立的本机 CarLife 桥；[Car+ 车联源](CARPLUS-SOURCE.md) 复用同一套桥，只替换拉起对象。
 
 ## 分工
 
