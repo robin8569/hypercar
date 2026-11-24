@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">HyperCar</string>
     <string name="app_author">fw867</string>
-    <string name="app_repo">github.com/fw867/hypercar</string>
+    <string name="app_repo">github.com/robin8569/hypercar</string>
     <string name="notification_channel_link">车联会话</string>
     <string name="notification_link_title">HyperCar 运行中</string>
 </resources>

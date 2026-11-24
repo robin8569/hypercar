@@ -38,7 +38,9 @@ sealed interface UpdateUiState {
 
 object UpdateCenter {
 
-    private const val API = "https://api.github.com/repos/fw867/hypercar/releases/latest"
+    // 本 fork（Car+ 车联改版）的更新源：不指向原版 fw867/hypercar，
+    // 否则会提示装回没有 Car+ 支持的上游版本。
+    private const val API = "https://api.github.com/repos/robin8569/hypercar/releases/latest"
     private const val PREFS = "hypercar_update"
     private const val KEY_LAST_CHECK = "last_check_at"
     private const val KEY_DISMISSED = "dismissed_tag"
