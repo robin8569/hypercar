@@ -3,6 +3,7 @@ package io.github.hypercar.spike
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
+import android.os.Binder
 import android.os.IBinder
 import android.view.Surface
 import android.view.MotionEvent
@@ -29,6 +30,7 @@ object SpikeShell {
     @Volatile private var connection: ServiceConnection? = null
     private var args: Shizuku.UserServiceArgs? = null
     private val bindMutex = Mutex()
+    private val displayOwner = Binder()
     @Volatile var isBinding: Boolean = false
         private set
 
@@ -58,6 +60,23 @@ object SpikeShell {
 
     fun prepareProjection(retainedMapName: String): String =
         call("prepareProjection") { it.prepareProjection(retainedMapName) }
+
+    internal fun captureInstrumentMap(id: Int, w: Int, h: Int, maxW: Int, maxH: Int): android.graphics.Bitmap? {
+        val shell = service ?: return null
+        if (maxW !in 1..960 || maxH !in 1..540) return null
+        return runCatching {
+            android.os.SharedMemory.create("hypercar-instrument-map", maxW * maxH * 4).use { memory ->
+                val size = shell.captureInstrumentMap(displayOwner, id, w, h, maxW, maxH, memory) ?: return null
+                if (size.size != 2 || size[0] !in 1..maxW || size[1] !in 1..maxH) return null
+                val buffer = memory.mapReadOnly()
+                try {
+                    val bitmap = android.graphics.Bitmap.createBitmap(size[0], size[1], android.graphics.Bitmap.Config.ARGB_8888)
+                    try { bitmap.apply { copyPixelsFromBuffer(buffer) } }
+                    catch (error: Throwable) { bitmap.recycle(); throw error }
+                } finally { android.os.SharedMemory.unmap(buffer) }
+            }
+        }.getOrNull()
+    }
 
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {
@@ -97,7 +116,7 @@ object SpikeShell {
             .processNameSuffix("spike")
             .debuggable(BuildConfig.DEBUG)
             // AIDL revision also distinguishes local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 2)
+            .version(BuildConfig.VERSION_CODE + 4)
         args = a
         // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
         // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：
@@ -128,7 +147,7 @@ object SpikeShell {
         flags: Int = 0,
         name: String = "hypercar-d2",
     ): String = runCatching {
-        service?.createDisplay(surface, width, height, dpi, flags, name) ?: "ERR 未连接"
+        service?.createDisplay(displayOwner, surface, width, height, dpi, flags, name) ?: "ERR 未连接"
     }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
 
     fun releaseDisplay(): String = runCatching {

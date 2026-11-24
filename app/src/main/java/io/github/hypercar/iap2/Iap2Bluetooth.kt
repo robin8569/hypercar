@@ -15,7 +15,6 @@ import android.os.Build
 import android.os.SystemClock
 import io.github.hypercar.bluetooth.BtProfiles
 import io.github.hypercar.bluetooth.isBmwBluetoothName
-import io.github.hypercar.settings.SettingsStore
 import java.io.Closeable
 import java.io.IOException
 import java.io.InterruptedIOException
@@ -179,7 +178,7 @@ class Iap2Bluetooth(
         }
         acceptedSockets.incrementAndGet()
         lastAcceptAt = SystemClock.elapsedRealtime()
-        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt " +
+        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt elapsedMs=$lastAcceptAt epochMs=${System.currentTimeMillis()} " +
             "listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
         handleIncomingSocket(socket, epoch, tag, acceptedAt)
     }
@@ -941,7 +940,7 @@ class Iap2Bluetooth(
                     context = appContext,
                     receiverAddress = receiverAddress,
                     pairedReceiver = evidence.identityPresent && evidence.receiverCredentialPresent,
-                    bmwAppsV1AuthFirst = inboundAt != null && SettingsStore.bmwAppsV1AuthFirstEnabled &&
+                    bondedBmwInbound = inboundAt != null &&
                         isBmwBluetoothName(receiverName) && isBonded(receiver),
                     navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
                     navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },

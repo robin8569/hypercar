@@ -13,6 +13,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Display
 import androidx.core.content.ContextCompat
+import io.github.hypercar.core.PipelineDiagnostics
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -31,6 +32,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * P1：把自绘首页（[CarHomeActivity]）放到一块 1920×720 的副屏上，并用编码器采集推给车机。
@@ -55,6 +57,7 @@ object CarUiCaster {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var caster: SpikeCaster? = null
+    private var encoderTargetFps = 0
     @Volatile private var displayId = -1
     @Volatile private var displayService: IBinder? = null
     private var cpuLock: PowerManager.WakeLock? = null
@@ -66,6 +69,7 @@ object CarUiCaster {
     val currentDisplayId: Int get() = displayId
 
     private val lifecycle = SessionResourceLifecycle()
+    private enum class RecoveryResult { SKIPPED, FAILED, REBUILT }
 
     suspend fun start(context: Context, current: () -> Boolean = { true }): String {
         val ticket = lifecycle.ticket()
@@ -100,14 +104,30 @@ object CarUiCaster {
         var previous = ""
         var pending = false
         var retryAt = 0L
-        var recovery: Deferred<Boolean>? = null
+        var recovery: Deferred<RecoveryResult>? = null
+        var frameRecovery = false
+        val watchdog = CarUiFrameWatchdog()
+        var lastSnapshot: PipelineDiagnostics? = null
+        val snapshotAt = AtomicLong()
+        fun videoOnline(pipeline: PipelineDiagnostics, now: Long): Boolean =
+            pipeline.active && pipeline.screenOwned == true && pipeline.videoChannelReady &&
+                pipeline.videoStream == "READY" && pipeline.tcpState == 1 &&
+                (pipeline.tcpSampleAgeMs ?: Long.MAX_VALUE) <= 3_000 &&
+                now - snapshotAt.get() <= 3_000
         fun log(message: String) = HyperCarRepo.log(
             "CARUI-LIFECYCLE: attempt=$attempt engine=$engine elapsedMs=${SystemClock.elapsedRealtime()} $message")
         try {
             while (active()) {
                 recovery?.takeIf { it.isCompleted }?.let {
-                    pending = !it.await()
-                    retryAt = SystemClock.elapsedRealtime() + 5_000
+                    val result = it.await()
+                    val now = SystemClock.elapsedRealtime()
+                    pending = !frameRecovery && result != RecoveryResult.REBUILT
+                    retryAt = now + 5_000
+                    if (frameRecovery && result != RecoveryResult.SKIPPED) {
+                        watchdog.restartFinished(now, rebuilt = result == RecoveryResult.REBUILT)
+                    } else if (result == RecoveryResult.REBUILT) {
+                        watchdog.restarted(now)
+                    }
                     recovery = null
                 }
                 val mainAlive = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
@@ -123,6 +143,14 @@ object CarUiCaster {
                     else -> display.state.toString()
                 }
                 val pipeline = HyperCarRepo.snapshots.value.pipeline
+                val now = SystemClock.elapsedRealtime()
+                if (pipeline !== lastSnapshot) {
+                    if (lastSnapshot?.let { it.generation != pipeline.generation || it.rebuilds != pipeline.rebuilds } == true) {
+                        watchdog.observe(now, false, pipeline.sourceUnits, pipeline.writtenFrames)
+                    }
+                    lastSnapshot = pipeline
+                    snapshotAt.set(now)
+                }
                 val screenOwner = when (pipeline.screenOwned) {
                     true -> "phone"
                     false -> "receiver"
@@ -140,28 +168,57 @@ object CarUiCaster {
                     (originalService !== userService || (displays != null && id > 0 && display == null))) {
                     pending = true
                 }
-                if (pending && recovery == null && mainAlive && SystemClock.elapsedRealtime() >= retryAt) {
+                val online = videoOnline(pipeline, now)
+                val stalled = watchdog.observe(now, running && recovery == null && online,
+                    pipeline.sourceUnits, pipeline.writtenFrames)
+                val retryFrame = !running && online && watchdog.shouldRetry(now)
+                if ((pending || stalled || retryFrame) && recovery == null && mainAlive && now >= retryAt) {
+                    val stalledSource = !pending
+                    frameRecovery = stalledSource
                     recovery = async {
+                        var frameRestartStarted = false
                         try {
-                            if (!active() || !ShizukuTools.isReady) return@async false
+                            if (!active()) return@async RecoveryResult.SKIPPED
+                            if (!ShizukuTools.isReady) {
+                                return@async if (retryFrame) RecoveryResult.FAILED else RecoveryResult.SKIPPED
+                            }
                             val bind = SpikeShell.connect(app)
-                            if (!active()) return@async false
+                            if (!active()) return@async RecoveryResult.SKIPPED
                             if (SpikeShell.userServiceBinder == null) {
                                 log("recovery waiting for user service bind=$bind")
-                                return@async false
+                                return@async if (retryFrame) RecoveryResult.FAILED else RecoveryResult.SKIPPED
                             }
-                            log("recovery rebuilding source oldDisplayId=$id")
-                            val result = lifecycle.restart(ticket, ::active, ::stopLocked) {
-                                startLocked(app, ::active)
+                            val result = if (stalledSource) {
+                                lifecycle.start(ticket, ::active, { stopLocked(keepAudio = true) }) {
+                                    val latest = HyperCarRepo.snapshots.value.pipeline
+                                    val checkedAt = SystemClock.elapsedRealtime()
+                                    if (running == retryFrame || displayId != id || !videoOnline(latest, checkedAt) ||
+                                        latest.generation != pipeline.generation ||
+                                        latest.rebuilds != pipeline.rebuilds ||
+                                        latest.sourceUnits != pipeline.sourceUnits) return@start null
+                                    frameRestartStarted = true
+                                    log("recovery rebuilding source reason=frame_stall retry=$retryFrame oldDisplayId=$id sourceUnits=${latest.sourceUnits} writtenFrames=${latest.writtenFrames}")
+                                    stopLocked(keepAudio = true)
+                                    startLocked(app, keepAudio = true, current = ::active)
+                                }
+                            } else {
+                                log("recovery rebuilding source oldDisplayId=$id")
+                                lifecycle.restart(ticket, ::active, { stopLocked() }) {
+                                    startLocked(app, current = ::active)
+                                }
                             }
                             val rebuilt = result != null && running
                             if (active()) log("recovery rebuilt=$rebuilt displayId=$displayId result=$result")
-                            rebuilt
+                            when {
+                                rebuilt -> RecoveryResult.REBUILT
+                                frameRestartStarted || !stalledSource -> RecoveryResult.FAILED
+                                else -> RecoveryResult.SKIPPED
+                            }
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (error: Exception) {
                             if (active()) log("recovery failed: ${error.message}")
-                            false
+                            if (frameRestartStarted || retryFrame || !stalledSource) RecoveryResult.FAILED else RecoveryResult.SKIPPED
                         }
                     }
                 }
@@ -173,16 +230,19 @@ object CarUiCaster {
         }
     }
 
-    private suspend fun startLocked(context: Context, current: () -> Boolean): String {
+    private suspend fun startLocked(context: Context, keepAudio: Boolean = false, current: () -> Boolean): String {
         val desiredCodec = SettingsStore.preferredVideoCodec
-        if (running && caster?.preferredCodec != desiredCodec) {
-            HyperCarRepo.log("CARUI: video codec preference changed; rebuilding home/map encoders")
-            stopLocked()
+        val requested = SettingsStore.encodingPlan
+        val limited = SettingsStore.receiverMaxFps != null
+        if (running && (caster?.preferredCodec != desiredCodec || encoderTargetFps != requested.fps ||
+                caster?.receiverRateLimited != limited)) {
+            HyperCarRepo.log("CARUI: rebuilding home/map encoders codec=$desiredCodec target_fps=${requested.fps}")
+            stopLocked(keepAudio)
         }
         if (running) {
             // A new native engine needs the touch callback and source dimensions again.
             installTouchListener()
-            CarAudioCapture.start(context)
+            if (!keepAudio) CarAudioCapture.start(context)
             // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
             // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
             runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
@@ -195,13 +255,12 @@ object CarUiCaster {
             }
             return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
-        val requested = SettingsStore.encodingPlan
         var lastError: Exception? = null
         var encoder = ""
         for (candidate in requested.encoderCandidates()) {
             if (!current()) return "会话已停止，取消编码启动"
             val next = SpikeCaster(width = candidate.width, height = candidate.height, fps = candidate.fps,
-                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec)
+                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec, receiverRateLimited = limited)
             try {
                 encoder = next.startEncoder()
             } catch (e: Exception) {
@@ -211,13 +270,14 @@ object CarUiCaster {
                 continue
             }
             caster = next
+            encoderTargetFps = requested.fps
             plan = candidate
             width = candidate.width
             height = candidate.height
             break
         }
         val c = caster ?: return "编码器启动失败: ${lastError?.message}"
-        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} dpi=$DPI $encoder")
+        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} requested_fps=${SettingsStore.videoFps} declared_max_fps=${SettingsStore.receiverMaxFps} effective_fps=${requested.fps} encoder_fps=${plan.fps} dpi=$DPI $encoder")
         val surface = c.encoderSurface ?: run {
             c.stop()
             caster = null
@@ -245,7 +305,7 @@ object CarUiCaster {
         val component = "io.github.hypercar/" + CarHomeActivity::class.java.name
         val launch = SpikeDisplay.amStartComponentOnDisplay(id, component, clearTask = false)
         if (!launch.contains(" → exit=0 ")) {
-            stopLocked()
+            stopLocked(keepAudio)
             return "首页启动失败：$launch"
         }
         installTouchListener()
@@ -263,7 +323,7 @@ object CarUiCaster {
         }
 
         running = true
-        CarAudioCapture.start(context)
+        if (!keepAudio) CarAudioCapture.start(context)
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
         scope.launch {
             kotlinx.coroutines.delay(900)
@@ -290,6 +350,7 @@ object CarUiCaster {
                 MapController.requestExit()
                 return
             }
+            if (MapController.overlayKey(key) || CarReceiverUi.state.value.limits.blockMapApp) return
             MapController.fullscreenDisplayId
         } else displayId
         if (target <= 0) return
@@ -327,8 +388,8 @@ object CarUiCaster {
         runCatching(block).onFailure { HyperCarRepo.log("CARUI: 释放 $resource 失败 ${it.message}") }
     }
 
-    private suspend fun stopLocked() {
-        release("audio") { CarAudioCapture.stop() }
+    private suspend fun stopLocked(keepAudio: Boolean = false) {
+        if (!keepAudio) release("audio") { CarAudioCapture.stop() }
         if (!running && displayId < 0 && caster == null) return
         // Await surface detachment before destroying encoders; keep the map/navigation alive.
         release("map") { MapController.stop() }

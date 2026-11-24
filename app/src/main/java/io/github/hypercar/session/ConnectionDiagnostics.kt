@@ -26,15 +26,52 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         var closeReason: String? = null, var tcp: String? = null, var reentry: Long? = null,
         var lastInbound: Long? = null,
     ) {
+        val mediaRecent = ArrayDeque<MediaEvent>()
+        val mediaKeyEvents = linkedMapOf<String, MediaEvent>()
+        val videoSavedAt = mutableMapOf<String, Long>()
+        private val keyframeRequests = linkedMapOf<KeyframeRequest, MutableMap<String, MediaEvent>>()
+
+        fun recordKeyframe(key: KeyframeRequest, event: MediaEvent): Boolean {
+            val group = keyframeRequests.getOrPut(key) { mutableMapOf() }
+            if (group.putIfAbsent(event.kind, event) != null) return false
+            if (keyframeRequests.size > MAX_KEYFRAME_REQUESTS) {
+                val oldest = keyframeRequests.minBy { (_, events) -> events.values.minOf { it.at } }.key
+                keyframeRequests.remove(oldest)
+                if (oldest == key) return false
+            }
+            return true
+        }
+
+        fun hasMediaEvents() = mediaRecent.isNotEmpty() || keyframeRequests.isNotEmpty()
+
         fun accepted(at: Long) {
             if (at <= (lastInbound ?: -1L)) return
             if (lastInbound != null || opened?.let { at >= it } == true) reentry = at
             lastInbound = at
         }
-        fun summary() = "diag_clock=uptime_ms anchor_uptime_ms=$anchorUptime anchor_unix_ms=$anchorEpoch " +
+        fun clockAndEvent() = "diag_clock=uptime_ms anchor_uptime_ms=$anchorUptime anchor_unix_ms=$anchorEpoch " +
             "event_rtsp=${rtsp ?: "unknown"} event_open_ms=${opened ?: "unknown"} event_close_ms=${closed ?: "unknown"} " +
-            "event_close=[${closeReason ?: "unknown"}] video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}"
+            "event_close=[${closeReason ?: "unknown"}]"
+
+        fun summary() = clockAndEvent() +
+            " video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}" + mediaTimeline()
+
+        fun mediaTimeline() = if (!hasMediaEvents()) "" else
+            (mediaKeyEvents.values + mediaRecent + keyframeRequests.values.flatMap { it.values })
+                .distinct().sortedBy { it.at }.joinToString(" | ", prefix = " media_timeline=[", postfix = "]") {
+                    "${it.at}ms ${it.kind} ${it.detail}"
+                }
     }
+    private data class MediaEvent(val at: Long, val kind: String, val detail: String)
+    private data class KeyframeRequest(val connection: ULong, val sequence: ULong)
+    private val keyframeIdentity = Regex("""\bconn=(\d+) request=(\d+)\b""")
+    private val keyframeEvents = setOf("keyframe_request", "keyframe_source_sync", "keyframe_sender_sync",
+        "keyframe_tcp_write", "keyframe_end")
+
+    private companion object {
+        const val MAX_KEYFRAME_REQUESTS = 4
+    }
+    private val mediaProcess = java.util.UUID.randomUUID()
     private var serial = 0L
     private val history = ArrayDeque<Attempt>()
     private val ctrlStages = setOf(Stage.CTRL_REGISTERED, Stage.CTRL_TCP_ACCEPTED, Stage.CTRL_INVITE_HEAD,
@@ -59,6 +96,61 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             if (tcp.isNotEmpty()) t.tcp = tcp
         }
     }
+
+    @Synchronized internal fun mediaEvent(id: Long, engine: Long, line: String): Boolean {
+        val t = history.find { it.id == id }?.transport?.takeIf { it.engine == engine } ?: return false
+        val parts = line.removePrefix("MEDIA-TIMELINE: ").split(' ', limit = 3)
+        if (parts.size != 3) return false
+        val at = parts[0].toLongOrNull()?.takeIf { it >= t.anchorUptime } ?: return false
+        val kind = parts[1]
+        val event = MediaEvent(at, kind, clean(parts[2]))
+        if (kind in keyframeEvents) {
+            keyframeIdentity.find(event.detail)?.destructured?.let { (conn, seq) ->
+                val connection = conn.toULongOrNull() ?: return false
+                val request = seq.toULongOrNull() ?: return false
+                return t.recordKeyframe(KeyframeRequest(connection, request), event)
+            }
+        }
+        val persist = when (kind) {
+            "first_video_written", "hid_touch_in" -> {
+                val first = t.mediaKeyEvents.putIfAbsent(kind, event) == null
+                val firstMapped = kind == "hid_touch_in" && event.detail.endsWith("mapped=true") &&
+                    t.mediaKeyEvents.putIfAbsent("first_mapped_touch", event) == null
+                first || firstMapped
+            }
+            "feedback_timeout", "feedback_error" -> {
+                t.mediaKeyEvents.putIfAbsent("first_$kind", event)
+                t.mediaKeyEvents["last_$kind"] = event
+                true
+            }
+            "feedback_queued" -> if (event.detail.endsWith("afterTimeout=true")) {
+                t.mediaKeyEvents["last_feedback_retry"] = event
+                true
+            } else t.mediaKeyEvents.putIfAbsent("first_feedback_queued", event) == null
+            "feedback_ok" -> t.mediaKeyEvents.putIfAbsent("first_feedback_ok", event) == null
+            "screen_keepalive_write", "keyframe_request", "video_write_slow", "video_write_end" -> {
+                if ((t.mediaKeyEvents[kind]?.at ?: -1L) > at) return false
+                t.mediaKeyEvents[kind] = event
+                val saved = t.videoSavedAt[kind]
+                (saved == null || at - saved >= 10_000).also { if (it) t.videoSavedAt[kind] = at }
+            }
+            else -> return false
+        }
+        t.mediaRecent.addLast(event)
+        if (t.mediaRecent.size > 12) t.mediaRecent.removeFirst()
+        return persist
+    }
+
+    @Synchronized internal fun mediaSummaries(): Map<String, String> = buildMap {
+        for (attempt in history) {
+            val transport = attempt.transport?.takeIf { it.hasMediaEvents() } ?: continue
+            val key = "$mediaProcess/${attempt.id}/${transport.engine}"
+            put(key, "ATTEMPT#${attempt.id} process=$mediaProcess engine=${transport.engine} profile=${attempt.profile} " +
+                "outcome=${attempt.outcome} ${transport.clockAndEvent()}${transport.mediaTimeline()} reason=${attempt.reason}")
+        }
+    }
+
+    @Synchronized internal fun exportSnapshot() = report() to mediaSummaries()
 
     @Synchronized fun rfcommAccepted(id: Long, peer: String?, at: Long) {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null && at >= it.startedUptime } ?: return
@@ -120,6 +212,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     internal enum class Observation(val label: String) {
         CARD_UNLOCKED("已刷卡"), ABOUT_TO_SELECT_CARPLAY("即将点旧设备 CarPlay"),
+        OLD_CARPLAY_ERROR("旧设备 CarPlay 报错"), NEW_LIST_PHONE_SELECTED("在连接新设备列表点手机"),
         ACL_UP("车机蓝牙 ACL 连上"), ACL_DOWN("车机蓝牙 ACL 断开"),
         MDNS_LOCAL_ANNOUNCEMENT("本机完整 mDNS 通告（最近观察）"),
         MDNS_PEER_QUERY("对端 CarPlay ctrl mDNS 查询（最近观察）"),

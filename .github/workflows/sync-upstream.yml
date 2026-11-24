@@ -89,25 +89,16 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -eu
-          # 正文用引号 heredoc，避免被 shell 展开
-          BODY=$(cat <<'TEXT'
-          自动同步在本机尝试把上游合并进 `carplus-ocar` 时发生冲突，已中止，**没有出包**。
-
-          处理方式：
-
-          1. 本地 `git fetch upstream main` 后 `git merge upstream/main`，手工解决冲突（多半在
-             `HyperCarRepo.kt`、`StartupRequirements.kt`、`SettingsScreen.kt`）。
-          2. 为保证版本号与上游一致，`version.properties` **一律取上游版本**：
-             `git checkout --theirs version.properties`（或直接照抄上游值）。
-          3. 解决后 `git push origin carplus-ocar`，再到 Actions 手动跑一次
-             `Build Release APK`（勾选 publish）。
-          TEXT
-          )
-          gh issue create \
-            --repo "$REPO" \
-            --title "上游 v${VERSION} 合并冲突，需要手工解" \
-            --body "$BODY"
-          echo "::error::上游 v${VERSION} 合并冲突，已开 issue"
+          # 开 issue 只是通知手段，失败（例如 Issues 被禁用）不影响「中止同步」这个主结果
+          if gh issue create \
+              --repo "$REPO" \
+              --title "上游 v${VERSION} 合并冲突，需要手工解" \
+              --body "自动同步把上游 v${VERSION} 合进 carplus-ocar 时发生冲突，已中止，本次未出包。本地执行 git fetch upstream main 后 git merge upstream/main 解冲突；version.properties 一律取上游值；解决后 push，再到 Actions 手动跑一次 Build Release APK 并勾选 publish。" ; then
+            echo "已开 issue 通知"
+          else
+            echo "::warning::自动开 issue 失败（可能 Issues 被禁用）；同步已中止，看本次 run 的失败通知即可"
+          fi
+          echo "::error::上游 v${VERSION} 合并冲突，已中止，未出包"
           exit 1
 
       - name: 触发正式出包

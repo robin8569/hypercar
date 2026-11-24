@@ -42,6 +42,15 @@ CarWith 实际画布受其本机编码器和2560×2560边界约束。VideoConfig
 
 ## 诊断与边界
 
+在手机诊断页开启「诊断日志」后再连接，本轮会话 SETUP 才会请求车机提供统计。切换记录开关后，新值在下一轮 SETUP 生效。排查借屏或卡顿时，可以用日志中的单调毫秒和主屏连接号对齐以下记录。
+
+- `screen_keepalive_write` 记录静止页也会发送的屏幕保活及其实际写完间隔。opcode 5 统计体里的 `queuedFramesAvg` 和 `lossAvg` 是兼容占位值。
+- `VIDEO-QUEUE` 记录主视频泵输入队列的帧数、字节数、最老帧龄及出队等待时间。`video_write_slow` 和 `video_write_end` 记录一次慢写的起止及 TCP 采样。ACK 表示对端内核已确认数据。
+- 主视频输入 FIFO 的上限为 32 帧、16 MiB、300 ms。积压超限时丢弃尚未进入 TCP 写入的队列帧，保留源控制事件，等待实时同步帧后恢复。恢复继续使用当前屏幕 TCP 和加密帧计数。
+- `VIDEO-QOS` 记录主屏视频 TCP 设置的 CS4（DSCP 32）及读回值。IPv4 使用 `IP_TOS`，IPv6 使用 `IPV6_TCLASS`。读回表明 socket 已设置，车端无线优先级仍需实车验证。
+- `keyframe_request`、`keyframe_source_sync`、`keyframe_sender_sync`、`keyframe_tcp_write` 按连接号和请求编号关联。摘要按组保留最近四次请求。同步帧标注 IDR 或 HEVC CRA，以及来源和 PTS。源帧可以来自缓存，转码器也可以独立生成输出同步帧。
+- `VIDEO-FEEDBACK` 仅归属发出请求时的主屏连接。`rfps=0` 表示车机报告零，`rfps=unknown` 表示没有可归属的有效值。车机报告收到视频后，还需要解码和合成才能显示。
+
 PIPELINE 分开显示 RECORD、资源、screen_setup、video_tcp_ready、源数量及已写帧。SETUP 和资源请求记录 CSeq、完整出站 plist/hex/哈希及 RTSP/业务应答。空体400只能证明请求被拒，EOF不能反推拒绝码。旧 TCP 端点一旦失效，先使输出和触摸所有者失效，再关闭 socket；连接号和采样年龄用于避免把旧连接统计当成本轮状态。
 
 保留目前已验证的 nonce、AAD、HKDF及NTP映射；没有证据时不因为别的接收器参数不同就改宝马加密和帧头。测试边界见[验证](VALIDATION.md)，协议见[PROTOCOL](PROTOCOL.md)。

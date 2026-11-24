@@ -77,7 +77,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import io.github.hypercar.net.CARPLAY_DEVICE_INFO_BOARD
+import io.github.hypercar.carui.CarUiSettings
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
@@ -125,6 +125,7 @@ fun SettingsScreen(
     linkConnected: Boolean = false,
 ) {
     var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
+    var showProjectionApps by rememberSaveable { mutableStateOf(false) }
     val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
     val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
@@ -154,6 +155,10 @@ fun SettingsScreen(
                             SettingsMenuItem("我的车机", "车机型号、目标设备与上车自动连接") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("自定义投屏应用", "仅对自绘车机 UI 生效 · 已选 ${CarUiSettings.projectionPackages.size} 个") {
+                                showProjectionApps = true
+                            }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -194,6 +199,9 @@ fun SettingsScreen(
             }
         }
     }
+    if (page == SettingsPage.Main && showProjectionApps) {
+        ProjectionAppsDialog { showProjectionApps = false }
+    }
 }
 
 @Composable
@@ -222,8 +230,6 @@ private fun DeveloperMenuSection() {
     var experimentResult by rememberSaveable { mutableStateOf<String?>(null) }
     var sending by remember { mutableStateOf(false) }
     var result by rememberSaveable { mutableStateOf<String?>(null) }
-    val deviceInfoModel = remember(SettingsRevision.value) { SettingsStore.carPlayDeviceInfoModelEnabled }
-    val bmwAppsV1AuthFirst = remember(SettingsRevision.value) { SettingsStore.bmwAppsV1AuthFirstEnabled }
     val armedTarget by HyperCarRepo.armedBmwCaffExperiment.collectAsStateWithLifecycle()
     var armError by remember { mutableStateOf<String?>(null) }
     var dialing by remember { mutableStateOf(false) }
@@ -233,8 +239,6 @@ private fun DeveloperMenuSection() {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("等待车机邀请时，手动补发当前服务的通告。不重新注册服务，也不更换端口。",
                 color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-            SwitchRow("随 mDNS 发送 model=$CARPLAY_DEVICE_INFO_BOARD", "用于对照车机的设备识别，在后续广播和手动重发时生效。",
-                checked = deviceInfoModel, onCheckedChange = { SettingsStore.carPlayDeviceInfoModelEnabled = it })
             CapsuleButton(if (sending) "发送中…" else "重发 mDNS 通告", enabled = !sending && !dialing, onClick = send@{
                 if (sending || dialing) return@send
                 sending = true
@@ -284,11 +288,6 @@ private fun DeveloperMenuSection() {
             dialResult?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
         }
     }
-    SectionLabel("宝马 iD8.5 蓝牙握手实验")
-    GlassPanel(contentPadding = PaddingValues(16.dp)) {
-        SwitchRow("普通 BMW Apps v1 先认证", "用于已配对宝马的入站 v1 握手，按 AA00 → 认证 → 1D00 的顺序。",
-            checked = bmwAppsV1AuthFirst, onCheckedChange = { SettingsStore.bmwAppsV1AuthFirstEnabled = it })
-    }
     SectionLabel("连接实验")
     GlassPanel(contentPadding = PaddingValues(16.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -309,6 +308,12 @@ private fun DeveloperMenuSection() {
             })
             CapsuleButton("即将点旧设备 CarPlay", onClick = {
                 experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.ABOUT_TO_SELECT_CARPLAY)
+            })
+            CapsuleButton("旧设备 CarPlay 报错", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.OLD_CARPLAY_ERROR)
+            })
+            CapsuleButton("在连接新设备列表点手机", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.NEW_LIST_PHONE_SELECTED)
             })
             CapsuleButton("复制本轮连接快照", enabled = !copying, onClick = copy@{
                 if (copying) return@copy
@@ -1391,6 +1396,11 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
             )
         }
     }
+    Text(
+        text = "所选帧率为目标值。车机声明的帧率上限更低时，以车机上限为准。",
+        style = MaterialTheme.typography.bodySmall,
+        color = TextSecondary,
+    )
 }
 
 /* ---------- 开关组 ---------- */

@@ -104,22 +104,6 @@ object SettingsStore {
             SettingsRevision.bump()
         }
 
-    var carPlayDeviceInfoModelEnabled: Boolean
-        get() = developerMenuVisible && p().getBoolean("carplay_device_info_model", false)
-        set(value) {
-            if (!developerModeEnabled) return
-            p().edit().putBoolean("carplay_device_info_model", value).apply()
-            SettingsRevision.bump()
-        }
-
-    var bmwAppsV1AuthFirstEnabled: Boolean
-        get() = developerMenuVisible && p().getBoolean("bmw_apps_v1_auth_first", false)
-        set(value) {
-            if (!developerModeEnabled) return
-            p().edit().putBoolean("bmw_apps_v1_auth_first", value).apply()
-            SettingsRevision.bump()
-        }
-
     var appThemeMode: AppThemeMode
         get() = AppThemeMode.fromValue(p().getString("app_theme_mode", "dark"))
         set(value) {
@@ -279,6 +263,7 @@ object SettingsStore {
     val preferredVideoCodec: VideoCodec
         get() = VideoCodecPolicy.preferred(videoCodec, videoCapabilities.hevcAllowed)
 
+    @Volatile var receiverMaxFps: Int? = null
     @Volatile var receiverViewport: Pair<Int, Int>? = null
 
     /** CarWith prewarm uses only this receiver's observed canvas, never custom UI size. */
@@ -300,7 +285,7 @@ object SettingsStore {
             // 有 /info 时用它；没有 /info 才回退设置。编码画布与引擎必须同源，
             // 但最终比例要跟车机实际 viewport 一致，否则接收端会横向压缩。
             val viewport = receiverViewport ?: (videoWidth to videoHeight)
-            return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps)
+            return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps).withReceiverMaxFps(receiverMaxFps)
         }
 
     var videoFps: Int
@@ -461,6 +446,7 @@ object SettingsStore {
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
+            append("\"request_receiver_stats\":").append(debugLogEnabled).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
             append("\"desktop_receiver\":").append(io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(

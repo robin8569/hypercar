@@ -36,14 +36,18 @@ mod rtsp;
 mod resource_trace;
 mod rtsp_uri;
 mod screen;
+mod screen_qos;
 mod screen_write;
+mod video_queue;
 mod h264;
 mod video_transcode;
 mod hevc;
 mod video_format;
+mod video_feedback;
 mod pipeline;
 mod tcp_diagnostics;
 mod screen_session;
+mod cluster_screen;
 mod screen_resource;
 mod srp6a;
 mod tlv8;
@@ -54,6 +58,7 @@ mod buffered_control;
 mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
+mod receiver_ui;
 mod shutdown;
 mod callback_context;
 #[cfg(test)]
@@ -132,6 +137,10 @@ pub(crate) fn emit_pipeline(json: &str) {
         let data=env.new_string(json)?;
         env.call_method(obj,"onPipeline","(Ljava/lang/String;)V",&[(&data).into()]).map(|_| ())
     });
+}
+
+pub(crate) fn emit_media_trace(at_ms: u64, event: &str, detail: &str) {
+    emit_log(&format!("MEDIA-TIMELINE: {at_ms} {event} {detail}"));
 }
 
 pub(crate) fn emit_event_channel(id: u64, at: u64, cause: &str, sample: Option<&tcp_diagnostics::TcpSnapshot>) {
@@ -215,6 +224,17 @@ pub(crate) fn emit_night_mode(night: bool) {
         )
         .map(|_| ())
     });
+}
+
+pub(crate) fn emit_receiver_ui(kind: &str, payload: serde_json::Value) {
+    let payload = payload.to_string();
+    emit_log(&format!("RECEIVER-UI: {kind} {payload}"));
+    call_listener("onReceiverUi", |env, obj| env.with_local_frame(2, |env| {
+        let kind = env.new_string(kind)?;
+        let payload = env.new_string(payload)?;
+        env.call_method(obj, "onReceiverUi", "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[(&kind).into(), (&payload).into()]).map(|_| ())
+    }));
 }
 
 /// Route forceKeyFrame to the active producer: CarWith CMD RESET or Kotlin MediaCodec.
@@ -313,20 +333,33 @@ pub(crate) fn emit_video_capabilities(hevc_allowed:bool) {
     });
 }
 
-pub(crate) fn emit_display_size(width: u32, height: u32) {
+pub(crate) fn emit_display_size(width: u32, height: u32, max_fps: Option<u32>) {
     call_listener("onDisplaySize", |env, obj| {
-        env.call_method(obj, "onDisplaySize", "(II)V", &[(width as jint).into(), (height as jint).into()]).map(|_| ())
+        env.call_method(obj, "onDisplaySize", "(III)V", &[(width as jint).into(), (height as jint).into(), (max_fps.unwrap_or(0) as jint).into()]).map(|_| ())
     });
 }
 
-pub(crate) fn emit_display_layout(width: u32, height: u32, layout: &display_layout::Layout) {
+pub(crate) fn emit_display_layout(width: u32, height: u32, layout: &display_layout::Layout, right_hand_drive: bool) {
     let v=layout.view; let s=layout.safe;
     call_listener("onDisplayLayout", |env,obj| {
-        env.call_method(obj,"onDisplayLayout","(IIIIIIIIIIZ)V", &[
+        env.call_method(obj,"onDisplayLayout","(IIIIIIIIIIZIZZ)V", &[
             (width as jint).into(),(height as jint).into(),v.x.into(),v.y.into(),v.w.into(),v.h.into(),
             s.x.into(),s.y.into(),s.w.into(),s.h.into(),(if layout.draw_outside { JNI_TRUE } else { JNI_FALSE }).into(),
+            layout.status_bar_edge.unwrap_or(-1).into(),
+            (if right_hand_drive { JNI_TRUE } else { JNI_FALSE }).into(),
+            (if layout.allows_focus { JNI_TRUE } else { JNI_FALSE }).into(),
         ]).map(|_| ())
     });
+}
+
+pub(crate) fn emit_view_area_choices(revision: i64, uuid: &str, targets: &[i32]) {
+    call_listener("onViewAreaChoices", |env, obj| env.with_local_frame(2, |env| {
+        let display = env.new_string(uuid)?;
+        let indices = env.new_int_array(targets.len() as jint)?;
+        env.set_int_array_region(&indices, 0, targets)?;
+        env.call_method(obj, "onViewAreaChoices", "(JLjava/lang/String;[I)V",
+            &[revision.into(), (&display).into(), (&indices).into()]).map(|_| ())
+    }));
 }
 
 fn with_env<T>(
@@ -921,6 +954,17 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequest
     }) {
         JNI_TRUE
     } else { JNI_FALSE }
+}
+
+/// Queue a choice from the receiver's last active view-area declaration.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestViewArea(
+    mut env: JNIEnv, _class: JClass, revision: jlong, display: JString, target: jint,
+) -> jboolean {
+    let Ok(uuid) = env.get_string(&display) else { return JNI_FALSE; };
+    let request = display_layout::ViewRequest { revision, uuid: uuid.into(), target };
+    if ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested()
+        && h.source_tx.send(engine::SourceEvent::RequestViewArea(request)).is_ok()) { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// Ask the accessory to show its own UI; never stop the session or the audio pump.
