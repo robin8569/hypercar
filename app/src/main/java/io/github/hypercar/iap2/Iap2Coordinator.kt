@@ -2,6 +2,7 @@ package io.github.hypercar.iap2
 
 import android.content.Context
 import io.github.hypercar.net.BluetoothHotspot
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -33,11 +34,71 @@ data class CarPlayEndpoint(
     val bluetoothHotspot: BluetoothHotspot? = null,
     /** Received directly in 0x5703 from a DENSO Outback in this handshake. */
     val densoOutbackWifi: Boolean = false,
+    /** The advertised AirPlay route carries no Wi-Fi identity of its own. */
+    val requiresBoundAirplayRoute: Boolean = false,
+    val addressOnlyAirplayReport: Boolean = false,
+    /** A route taken out of the deferred queue needs the new request's credential proof. */
+    val requiresMatchingAirplayCredentials: Boolean = false,
+    val airplayRouteBinding: AirplayRouteBinding? = if (requiresBoundAirplayRoute) AirplayRouteBinding() else null,
+    /** A replay can retain the current credentials while advertising the previous hotspot's address. */
+    val replayedWifiConfiguration: Iap2Messages.WifiConfiguration? = null,
+    /** Queued reports expire on a same-socket DETECT, including copies made by the endpoint inbox. */
+    val sourceGeneration: Iap2EndpointGeneration? = null,
 ) {
+    val verifiedAirplayNetworkHandle: Long? get() = airplayRouteBinding?.networkHandle
+    internal val sourceIsCurrent: Boolean get() = sourceGeneration?.isCurrent != false
+
+    internal fun whileSourceCurrent(action: () -> Unit): Boolean =
+        sourceGeneration?.runIfCurrent(action) ?: run { action(); true }
+
     /** Only this peer's current Wi-Fi parameters can start or replace an Android request. */
     internal fun canRequestHotspot(current: BluetoothHotspot?): Boolean =
-        !fromInvite && !proactive && current != null && bluetoothHotspot == current && current.ssid == ssid
+        sourceIsCurrent && !fromInvite && !proactive && current != null && bluetoothHotspot == current && current.ssid == ssid
 }
+
+/** A logical control generation on one physical RFCOMM socket. EOF alone leaves accepted reports usable. */
+class Iap2EndpointGeneration internal constructor(private val current: () -> Boolean = { true }) {
+    @Volatile private var retired = false
+    internal val isCurrent: Boolean get() = !retired && current()
+
+    @Synchronized internal fun retire() { retired = true }
+
+    @Synchronized internal fun runIfCurrent(action: () -> Unit): Boolean {
+        if (!isCurrent) return false
+        action()
+        return true
+    }
+}
+
+/** One physical RFCOMM worker's current accepted endpoint. */
+internal class Iap2RfcommEndpointState {
+    @Volatile private var source: Iap2EndpointGeneration? = null
+
+    val hasCurrentEndpoint: Boolean get() = source?.isCurrent == true
+
+    fun accepted(endpoint: CarPlayEndpoint) {
+        val generation = endpoint.sourceGeneration ?: return
+        if ((!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) && generation.isCurrent) {
+            source = generation
+        }
+    }
+}
+
+/** Copies of one address report share its first successful Network verification. */
+class AirplayRouteBinding {
+    private val verifiedNetwork = AtomicReference<Long?>(null)
+    internal val networkHandle: Long? get() = verifiedNetwork.get()
+    internal fun bind(networkHandle: Long): Boolean =
+        verifiedNetwork.compareAndSet(null, networkHandle) || verifiedNetwork.get() == networkHandle
+}
+
+/** Resolve under the receiver's endpoint lock, then commit only if the report is accepted. */
+class Iap2EndpointUpdate(
+    val endpoint: CarPlayEndpoint,
+    val commitDeferred: (CarPlayEndpoint) -> Unit,
+    val commit: () -> Unit,
+)
+typealias Iap2EndpointProposal = () -> Iap2EndpointUpdate?
 
 /**
  * iAP2 协商层对外门面（Orchestrator 的唯一入口）。
@@ -60,13 +121,12 @@ class Iap2Coordinator(
     private val preferredMac: () -> String? = { null },
     /** 本机真实蓝牙 MAC（Shizuku 解析，由上层注入；0x4300/0x4E0C/0x4E0E 用）。 */
     private val deviceMacProvider: suspend () -> String?,
-    /** 车机档案：发 iAP2 前是否主动断开该车机的 HFP/A2DP（宝马=false，奥迪=true）。 */
-    private val dropProfilesBeforeIap2: Boolean = true,
-    private val allowOutboundIap2: Boolean = true,
-    private val profileId: String = "",
+    private val profile: io.github.hypercar.headunit.HeadUnitProfile,
+    private val canStartSession: () -> Boolean,
     private val log: (String) -> Unit,
     private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
     private val diagnosticAttempt: () -> Long = { 0L },
+    private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
 
     private val appContext = context.applicationContext
@@ -75,7 +135,7 @@ class Iap2Coordinator(
     private var bluetooth: Iap2Bluetooth? = null
 
     @Volatile
-    private var endpointCallback: ((CarPlayEndpoint) -> Unit)? = null
+    private var endpointCallback: ((Iap2EndpointProposal) -> Boolean)? = null
 
     private val phoneIdentity = io.github.hypercar.net.PhoneIdentitySnapshot(
         nowMillis = android.os.SystemClock::elapsedRealtime,
@@ -103,7 +163,7 @@ class Iap2Coordinator(
      *
      * 可重复调用：已在运行时只更新回调，不重建蓝牙栈。
      */
-    fun start(onEndpoint: (CarPlayEndpoint) -> Unit) = startTransport(true, onEndpoint)
+    fun start(onEndpoint: (Iap2EndpointProposal) -> Boolean) = startTransport(true, onEndpoint)
 
     fun keepIdentityOnly() = startTransport(false, null)
 
@@ -119,7 +179,7 @@ class Iap2Coordinator(
         endpointCallback = null
     }
 
-    private fun startTransport(allowSessions: Boolean, onEndpoint: ((CarPlayEndpoint) -> Unit)?) {
+    private fun startTransport(allowSessions: Boolean, onEndpoint: ((Iap2EndpointProposal) -> Boolean)?) {
         synchronized(this) {
             endpointCallback = onEndpoint
             bluetooth?.let { existing ->
@@ -143,13 +203,13 @@ class Iap2Coordinator(
                     targetProvider = targetMac,
                     preferredProvider = preferredMac,
                     bluetoothMacProvider = ::currentBluetoothMac,
-                    dropProfilesBeforeIap2 = dropProfilesBeforeIap2,
-                    allowOutboundIap2 = allowOutboundIap2,
-                    profileId = profileId,
+                    profile = profile,
+                    canStartSession = canStartSession,
                     log = log,
-                    onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
+                    onEndpoint = { proposed -> endpointCallback?.invoke(proposed) == true },
                     onInboundSession = onInboundSession,
                     diagnosticAttempt = diagnosticAttempt,
+                    wifiCredentialHistory = wifiCredentialHistory,
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt

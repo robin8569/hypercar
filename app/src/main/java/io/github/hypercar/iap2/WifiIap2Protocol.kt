@@ -16,17 +16,24 @@ internal class WifiIap2Protocol(
     onVehicleStatus: (Iap2VehicleStatus) -> Unit = {},
     profileId: String = "",
     private val onPeerSynAccepted: () -> Unit = {},
+    onVehicleLocation: (Iap2VehicleLocation?) -> Unit = {},
+    onWheelSpeed: (Iap2WheelSpeed?) -> Unit = {},
+    callStateSource: Iap2CallStateSource? = null,
+    private val onTransportReady: (Boolean) -> Boolean = { true },
 ) {
     private val audiMib3 = profileId == "audi_mib3"
-    private val challengeSize = if (audiMib3 || profileId == "bmw_id6") 20 else 32
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log, initializeArtworkWithEmptyFile = true)
     private val vehicle = Iap2VehicleStatusSession(onVehicleStatus, log)
+    private val location = Iap2VehicleLocationSession(onVehicleLocation, onWheelSpeed)
     private var identification: Iap2Messages.Identification? = null
+    private var authenticated = false
     private var navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName)
+    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName,
+        callState = { callStateSource?.snapshot() ?: Iap2CallSample.Unavailable },
+        observeCalls = { callStateSource?.setSubscribed(it) })
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -41,6 +48,7 @@ internal class WifiIap2Protocol(
     private var lastQueuedMessage: Int? = null
     private var receivedNowPlayingStarts = 0L
     private var queuedNowPlayingUpdates = 0L
+    private var locationFrames = 0L
     private var challengeSequence: Int? = null
     private var challengeAcknowledged = false
     private var challengeResponseReceived = false
@@ -53,8 +61,8 @@ internal class WifiIap2Protocol(
         "rx_frames=$receivedFrames tx_frames=$sentFrames $lastRx $lastTx " +
         "${media.diagnosticSummary} rx_5000=$receivedNowPlayingStarts queued_5001=$queuedNowPlayingUpdates " +
         "last_rx_csm=${lastReceivedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
-        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}" +
-        (if (audiMib3) " $challengeDiagnostic" else "") + "; link output/queue only, RTSP acceptance separate"
+        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
+        "$challengeDiagnostic; link output/queue only, RTSP acceptance separate"
     private var now = 0L
     private var peerWaitSince: Long? = null
     private var nextPeerWaitLog = 0L
@@ -68,27 +76,29 @@ internal class WifiIap2Protocol(
     private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
     val ready: Boolean get() = phase == "READY" && !failed && engine.queuedControlPackets == 0
+    private var readyReported = false
     var failed = false
         private set
 
     init {
         engine.hudLog = log
         engine.deferInitialDetectEcho = audiMib3
-        if (audiMib3) {
-            engine.onPeerAcknowledgement = { ack, lastSent ->
-                val sequence = challengeSequence
-                if (sequence != null && !challengeAcknowledged) {
-                    // Accept only cumulative ACKs that cover AA02 without acknowledging unsent bytes.
-                    val distanceToLastSent = (lastSent - sequence) and 255
-                    val distanceToAck = (ack - sequence) and 255
-                    if (distanceToLastSent < 128 && distanceToAck <= distanceToLastSent) {
-                        challengeAcknowledged = true
-                        log("AUTH AA02 cumulative ACK seq=$sequence peer_ack=$ack")
-                    }
+        engine.onPeerAcknowledgement = { ack, lastSent ->
+            val sequence = challengeSequence
+            if (sequence != null && !challengeAcknowledged) {
+                // Accept only cumulative ACKs that cover AA02 without acknowledging unsent bytes.
+                val distanceToLastSent = (lastSent - sequence) and 255
+                val distanceToAck = (ack - sequence) and 255
+                if (distanceToLastSent < 128 && distanceToAck <= distanceToLastSent) {
+                    challengeAcknowledged = true
+                    log("AUTH AA02 cumulative ACK seq=$sequence peer_ack=$ack")
                 }
             }
         }
         engine.onDetectionRestart = {
+            readyReported = false
+            // Invalidate the old generation before any new output is handed to the writer.
+            onTransportReady(false)
             if (challengeSequence != null) log("AUTH LINK reset $challengeDiagnostic")
             challengeSequence = null
             challengeAcknowledged = false
@@ -98,7 +108,10 @@ internal class WifiIap2Protocol(
             media.reset()
             nowPlaying.reset()
             vehicle.reset()
+            location.reset()
+            locationFrames = 0L
             identification = null
+            authenticated = false
             subscriptions.reset()
             navigation = RouteGuidanceSession(log)
             phase = "LINK"
@@ -132,7 +145,19 @@ internal class WifiIap2Protocol(
 
     fun takeHudOutput() = engine.takeHudOutput()
 
-    fun endHudTrace() = engine.endHudTrace("transport_ended")
+    /** The native writer adds its FIFO readiness barrier after these authentication frames. */
+    fun outputEnqueued() {
+        if (ready && !readyReported) {
+            // The just-enqueued authentication frames may have filled the native queue.
+            readyReported = onTransportReady(true)
+        }
+    }
+
+    fun end() {
+        subscriptions.reset()
+        location.reset()
+        engine.endHudTrace("transport_ended")
+    }
 
     fun feed(bytes: ByteArray, nowMillis: Long): ByteArray {
         if (failed) return ByteArray(0)
@@ -153,6 +178,7 @@ internal class WifiIap2Protocol(
         if (failed) return ByteArray(0)
         now = nowMillis
         media.diagnosticsTick()
+        location.expire(now)
         if (!started) {
             if (peerWaitSince == null) peerWaitSince = now
             if (now >= nextPeerWaitLog) {
@@ -163,9 +189,8 @@ internal class WifiIap2Protocol(
         }
         engine.advanceTime(now)
         if (phase == "LINK" && engine.state == Iap2LinkEngine.State.NORMAL) {
-            phase = "IDENTIFICATION"
-            deadline = now + 15_000
-            send(0x1d00)
+            // xiap2 0x6b530 selects the opening CSM from the accepted control session version.
+            if (engine.controlSessionVersion == 1) requestCertificate() else requestIdentification()
         }
         while (true) {
             when (val event = engine.pollEvent() ?: break) {
@@ -204,18 +229,23 @@ internal class WifiIap2Protocol(
             if (phase == "READY") vehicle.receive(frame.body)
             return
         }
-        if (media.handle(frame) || nowPlaying.handle(frame)) return
-        if (subscriptions.handle(frame)) {
-            if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
+        if (id == Iap2MessageIds.LOCATION_INFORMATION) {
+            if (phase == "READY") {
+                val wasFixed = location.hasFix
+                val hadWheelSpeed = location.wheelSpeed != null
+                location.receive(frame.body, now)
+                locationFrames++
+                val wheelSpeed = location.wheelSpeed
+                if (locationFrames <= 3 || locationFrames % 60 == 0L || location.hasFix != wasFixed ||
+                    (wheelSpeed != null) != hadWheelSpeed) {
+                    log("GPS: RX id=0xfffb count=$locationFrames bytes=${frame.body.size} fixValid=${location.hasFix} wheelSpeedValid=${wheelSpeed != null} wheelSpeedMps=${wheelSpeed?.metersPerSecond ?: "unknown"}")
+                }
+            }
             return
         }
-        if (id == 0x1d01 && phase == "READY") {
-            val ident = Iap2Messages.parseIdentification(frame.body)
-            navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
-            subscriptions.identify(ident.model, ident.manufacturer)
-            media.identify(ident.hidComponents)
-            send(0x1d02)
-            subscribeVehicle(ident)
+        if (media.handle(frame) || nowPlaying.handle(frame)) return
+        if (subscriptions.handle(frame)) {
+            if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until identification and authentication complete")
             return
         }
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
@@ -226,60 +256,96 @@ internal class WifiIap2Protocol(
             return
         }
         when (id) {
-            0x1d01 -> if (phase == "IDENTIFICATION") {
-                val identification = Iap2Messages.parseIdentification(frame.body)
-                this.identification = identification
-                navigation.declareReceiveSupport(identification.acceptsRouteGuidance)
-                subscriptions.identify(identification.model, identification.manufacturer)
-                media.identify(identification.hidComponents)
-                val serialSupported = identification.declaresSend(0xaa06) == true
-                send(0x1d02)
-                phase = "CERTIFICATE"
-                deadline = now + 10_000
-                nextWaitLog = now + 2_000
-                // Box firmware 0x60a74/0x634b8 checks AA06 support and adds empty parameter 0.
-                // Unknown/unsupported peers retain CatPlay's default direct certificate request.
-                log("AUTH certificate request=${if (serialSupported) "serial-first (peer declares AA06)" else "direct (AA06 not declared)"}")
-                if (serialSupported) send(0xaa00, Iap2Csm.param(0, ByteArray(0))) else send(0xaa00)
-            }
+            0x1d01 -> if (phase == "IDENTIFICATION" || phase == "READY") acceptIdentification(frame.body)
             0xaa06 -> if (phase == "CERTIFICATE" && !retriedCertificate) {
                 retriedCertificate = true
                 send(0xaa00)
             }
             0xaa01 -> if (phase == "CERTIFICATE") {
-                if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
+                val certificate = Iap2Csm.nonEmptyParameter(frame.body, 0)
+                if (certificate == null) {
                     fail("empty certificate")
                     return
                 }
+                val certificateParamBytes = certificate.value.size + Iap2Csm.PARAM_HEADER_BYTES
+                val challengeSize = mfiChallengeLengthForCertificateParam(certificateParamBytes)
                 phase = "CHALLENGE"
                 deadline = now + 10_000
                 nextWaitLog = now + 2_000
                 val challenge = nonce(challengeSize)
                 require(challenge.size == challengeSize)
+                log("AUTH AA02 selected certificateParamBytes=$certificateParamBytes challengeBytes=$challengeSize")
                 send(0xaa02, Iap2Csm.param(0, challenge))
             }
             0xaa03 -> if (phase == "CHALLENGE") {
-                if (audiMib3) {
-                    challengeResponseReceived = true
-                    log("AUTH AA03 received $challengeDiagnostic")
-                }
+                challengeResponseReceived = true
+                log("AUTH AA03 received $challengeDiagnostic")
                 if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
-                    fail("empty challenge response")
+                    fail("invalid challenge response parameter")
                     return
                 }
                 send(0xaa05)
-                phase = "READY"
-                log("READY challenge response received; compatibility result only, certificate/signature not verified")
-                greetings()
-                media.authenticated()
-                nowPlaying.authenticated()
-                subscriptions.authenticated()
-
+                if (failed) return
+                authenticated = true
+                if (identification == null) requestIdentification() else enterReady()
             }
             0xaa04, 0x1d03 -> fail("peer rejected id=0x${id.toString(16)}")
             // Unknown payloads still receive the link ACK.
             else -> if (unknown.add(id)) log("ACK-only id=0x${id.toString(16)} body=${frame.body.size}B")
         }
+    }
+
+    private fun requestIdentification() {
+        phase = "IDENTIFICATION"
+        deadline = now + 15_000
+        send(0x1d00)
+    }
+
+    private fun requestCertificate(serialSupported: Boolean = false) {
+        phase = "CERTIFICATE"
+        deadline = now + 10_000
+        nextWaitLog = now + 2_000
+        // Box firmware 0x60a74/0x634b8 checks AA06 support before adding an empty parameter 0.
+        val request = when {
+            serialSupported -> "serial-first (peer declares AA06)"
+            identification == null -> "direct (control version 1)"
+            else -> "direct (AA06 not declared)"
+        }
+        log("AUTH certificate request=$request")
+        if (serialSupported) send(0xaa00, Iap2Csm.param(0, ByteArray(0))) else send(0xaa00)
+    }
+
+    private fun acceptIdentification(body: ByteArray) {
+        if (engine.controlSessionVersion == 1 &&
+            Iap2Csm.parseParams(body).sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != body.size) {
+            fail("invalid identification parameters")
+            return
+        }
+        val peer = Iap2Messages.parseIdentification(body)
+        identification = peer
+        navigation.declareReceiveSupport(peer.acceptsRouteGuidance, peer.currentRoadLimits)
+        subscriptions.identify(peer.model, peer.manufacturer)
+        media.identify(peer.hidComponents)
+        send(0x1d02)
+        if (failed) return
+        when {
+            phase == "READY" -> {
+                subscribeVehicle(peer)
+                subscribeLocation(peer)
+            }
+            authenticated -> enterReady()
+            else -> requestCertificate(peer.declaresSend(0xaa06) == true)
+        }
+    }
+
+    private fun enterReady() {
+        phase = "READY"
+        log("READY challenge response received and identification accepted; compatibility result only, certificate/signature not verified")
+        greetings()
+        media.authenticated()
+        nowPlaying.authenticated()
+        subscriptions.authenticated()
+        identification?.let(::subscribeLocation)
     }
 
     private fun greetings() {
@@ -299,6 +365,10 @@ internal class WifiIap2Protocol(
         vehicle.subscribe(peer)?.let { send(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES, it) }
     }
 
+    private fun subscribeLocation(peer: Iap2Messages.Identification) {
+        if (!failed) location.subscribe(peer).forEach { send(it.messageId, it.body) }
+    }
+
     private fun send(id: Int, vararg parts: ByteArray) {
         if (failed) return
         val body = parts.fold(ByteArray(0)) { a, b -> a + b }
@@ -310,10 +380,10 @@ internal class WifiIap2Protocol(
             val end = minOf(frame.size, offset + limit)
             val hudMessageId = if (id == 0x5201 || id == 0x5202) id else 0
             val onSequenceAssigned: ((Int) -> Unit)? =
-                if (audiMib3 && id == 0xaa02 && end == frame.size) {
+                if (id == 0xaa02 && end == frame.size) {
                     { sequence ->
                         challengeSequence = sequence
-                        log("AUTH AA02 challengeBytes=$challengeSize final_seq=$sequence")
+                        log("AUTH AA02 final_seq=$sequence")
                     }
                 } else null
             if (!engine.sendControl(frame.copyOfRange(offset, end), now, hudMessageId = hudMessageId,
@@ -344,6 +414,7 @@ internal class WifiIap2Protocol(
     private fun fail(reason: String) {
         if (!failed) log("FAILED $reason")
         failed = true
+        location.reset()
         engine.feedEof()
     }
 }

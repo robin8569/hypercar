@@ -53,24 +53,20 @@ class Iap2Bluetooth(
     private val targetProvider: () -> String?,
     /** 本机真实蓝牙 MAC（会话里 0x4300/0x4E0C/0x4E0E 用）。 */
     private val bluetoothMacProvider: () -> String,
-    /**
-     * 发 iAP2 前是否主动断开该车机的 HFP/A2DP（车机档案 `dropProfilesBeforeIap2`）。
-     *
-     * 奥迪需要；**宝马不能断**（2026-10-25 现场：断了会把 ACL 一起拽掉，车机反复重连，
-     * 反而不再发起 CarPlay）。
-     */
-    private val dropProfilesBeforeIap2: Boolean = true,
-    private val allowOutboundIap2: Boolean = true,
-    private val profileId: String = "",
+    private val profile: io.github.hypercar.headunit.HeadUnitProfile,
+    private val canStartSession: () -> Boolean,
     private val preferredProvider: () -> String? = { null },
     private val log: (String) -> Unit,
     /** 每次拿到/更新端点即回调（0x5703 凭据与 0x4301 端点都会触发，可能多次）。 */
-    private val onEndpoint: (CarPlayEndpoint) -> Unit,
+    private val onEndpoint: (Iap2EndpointProposal) -> Boolean,
     /** 会话结束（拿到端点后链路断开，或中途失败）——上层用来收尾/重排。 */
     private val onSessionEnded: (String) -> Unit,
     private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
     private val diagnosticAttempt: () -> Long = { 0L },
+    private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
+    private val profileId = profile.protocolProfileId
+
     companion object {
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
         /** 手机侧（我们监听）的 iAP2 服务 UUID；配件端（车机监听）是 …decacaff。 */
@@ -211,7 +207,7 @@ class Iap2Bluetooth(
      * （拆链会让车机收起 CarPlay 图标），也不会把车机的下一轮挡在门外。
      */
     @Volatile
-    private var sessionProductive = false
+    private var sessionEndpoints = Iap2RfcommEndpointState()
 
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
     private data class ServiceResult(val revision: Long, val available: Boolean)
@@ -310,11 +306,11 @@ class Iap2Bluetooth(
         val target = targetProvider()
         log(
             "BT: 启动——监听 $SDP_NAME（…cafe，等车机连入）" +
-                (if (allowOutboundIap2) " + 出站尝试车机 iAP2 服务（…caff）" else "，仅被动监听") +
+                (if (profile.allowOutboundIap2) " + 出站尝试车机 iAP2 服务（…caff）" else "，仅被动监听") +
                 if (target != null) {
                     "，目标：$target（只连/只收该设备）"
                 } else {
-                    if (allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
+                    if (profile.allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
                 },
         )
         var lastRegistrationErrorAt: Long? = null
@@ -353,7 +349,7 @@ class Iap2Bluetooth(
             serverThread = this
             start()
         }
-        if (allowOutboundIap2) {
+        if (profile.allowOutboundIap2) {
             Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
                 isDaemon = true
                 clientThread = this
@@ -446,6 +442,10 @@ class Iap2Bluetooth(
             rejectSocket(socket, tag, "non-target")
             return
         }
+        if (!canStartSession()) {
+            rejectSocket(socket, tag, "profile-no-longer-available")
+            return
+        }
         cancelBmwProbe("inbound $tag")
         if (cafeReservations.pending != null) {
             rejectSocket(socket, tag, "inbound-handoff-already-pending")
@@ -468,7 +468,7 @@ class Iap2Bluetooth(
                 rejectSocket(socket, tag, "active-session-during-airplay")
                 return
             }
-            if (sessionProductive) {
+            if (sessionEndpoints.hasCurrentEndpoint) {
                 log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
                 rejectSocket(socket, tag, "productive-session")
                 return
@@ -613,14 +613,14 @@ class Iap2Bluetooth(
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
             val ticket = sessions.ticket()
-            if (ticket == null || sessions.outboundPausedForWifi || sessionActive.get()) {
+            if (ticket == null || sessions.outboundPausedForWifi || sessionActive.get() || !canStartSession()) {
                 sleepQuietly(2_000)
                 continue
             }
             // 首轮先给车机主动连入的机会——但只对「会因此断配置文件」的档案有意义：
             // 宝马档案压根不断 HFP/A2DP（车机自己会在 ACL 连上后 ~4s 连入 iAP2），
             // 等这 8s 只会白白推迟出站探测。
-            if (dropProfilesBeforeIap2 && !inboundGraceDone) {
+            if (profile.dropProfilesBeforeIap2 && !inboundGraceDone) {
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
@@ -661,9 +661,9 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
-                if (!sessions.allowsOutbound(ticket)) break
+                if (!sessions.allowsOutbound(ticket) || !canStartSession()) break
                 val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, device.address)
-                if (dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
+                if (profile.dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
                     // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
                     // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
@@ -681,7 +681,7 @@ class Iap2Bluetooth(
                     }
                 } else if (!profileDropSkippedLogged) {
                     profileDropSkippedLogged = true
-                    log("BT-C: 保留 HFP/A2DP：档案允许断开=$dropProfilesBeforeIap2 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
+                    log("BT-C: 保留 HFP/A2DP：档案允许断开=${profile.dropProfilesBeforeIap2} 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
                 }
                 val socket = tryConnect(device, ticket)
                 if (socket != null) {
@@ -861,12 +861,14 @@ class Iap2Bluetooth(
         inboundGeneration: Long? = null,
         handoff: BmwCaffHandoff<BluetoothSocket>? = null,
     ) {
+        val workerEndpoints = Iap2RfcommEndpointState()
         // Publish the socket atomically with the pause check, so pausing can always close it.
         synchronized(this) {
             val rejected = when {
                 !running -> "not-running"
                 inboundGeneration != null && generation.get() != inboundGeneration -> "stale-worker-generation"
                 !sessions.allows(ticket) -> "stale-session-ticket"
+                !canStartSession() -> "profile-no-longer-available"
                 cafeReservations.pending !== handoff -> "inbound-handoff-superseded"
                 handoff != null && (io.github.hypercar.session.HyperCarRepo.hasAirPlayTransport ||
                     !io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(targetProvider(), safeAddress(socket.remoteDevice))) ->
@@ -888,10 +890,11 @@ class Iap2Bluetooth(
             if (handoff != null) log("$tag: 旧 …caff 握手已退出，接管保留的入站 RFCOMM")
             sessionSocket.set(socket)
             sessionStarts.incrementAndGet()
-            sessionProductive = false
+            sessionEndpoints = workerEndpoints
             currentSocket.set(socket)
         }
         val attempt = caffAttempt.takeIf { it != 0L } ?: diagnosticAttempt()
+        val wifiHistory = wifiCredentialHistory()
         inboundAt?.let { onInboundSession(attempt, safeAddress(socket.remoteDevice), it) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
@@ -926,29 +929,32 @@ class Iap2Bluetooth(
                     },
                     // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                     // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
-                    onEndpoint = { endpoint ->
-                        fun acceptEndpoint(): Boolean {
-                            if (!sessions.allows(ticket)) return false
-                            if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) sessionProductive = true
-                            return true
+                    publishEndpoint = { propose ->
+                        val current = if (probeAdmission == null) sessions.allows(ticket) else synchronized(this) {
+                            activeCaffSocket === socket && sessions.allows(ticket)
                         }
-                        val accepted = if (probeAdmission == null) acceptEndpoint() else synchronized(this) {
-                            activeCaffSocket === socket && acceptEndpoint()
+                        current && onEndpoint {
+                            propose()?.let { update ->
+                                Iap2EndpointUpdate(update.endpoint, { released ->
+                                    update.commitDeferred(released)
+                                    workerEndpoints.accepted(released)
+                                }) {
+                                    update.commit()
+                                    workerEndpoints.accepted(update.endpoint)
+                                }
+                            }
                         }
-                        if (accepted) onEndpoint(endpoint)
                     },
                     context = appContext,
                     receiverAddress = receiverAddress,
+                    wifiHistory = wifiHistory.forReceiver(receiverAddress),
                     pairedReceiver = evidence.identityPresent && evidence.receiverCredentialPresent,
                     bondedBmwInbound = inboundAt != null &&
                         isBmwBluetoothName(receiverName) && isBonded(receiver),
                     navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
                     navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
                     onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
-                    // **必须显式传当前车机档案**：不传就一直用构造函数默认值 BMW_ID85，
-                    // 设置页切成 通用(0.27)/WinPlay/Audi（或远程下发的档案）后，
-                    // 0x4300 / EA / 0x4E0E / 档案A退场这些差异全都不生效（2026-10-25 定谳）。
-                    profile = io.github.hypercar.headunit.HeadUnitProfiles.current(),
+                    profile = profile,
                 )
             session.run(SESSION_TIMEOUT_MILLIS)
             // Phase 1 完成：进入保活泵，直到链路断开（0x4301 等生命周期消息在此处理）
@@ -1044,7 +1050,14 @@ private class RfcommLinkChannel(
     private var socketWriteBytes = 0L
     private val files = java.util.concurrent.ArrayBlockingQueue<ByteArray>(64)
     private val controls = LinkedBlockingQueue<ByteArray?>()
-    private val readyLatch = CountDownLatch(1)
+    private var readyLatch = CountDownLatch(1)
+    private var workerGeneration: Long? = null
+    // Endpoint commits can hold the application inbox lock. Keep that lock order
+    // independent of the RFCOMM engine lock used by Android socket I/O.
+    private var endpointSource = Iap2EndpointGeneration()
+
+    @Volatile override var linkGeneration = 0L
+        private set
 
     @Volatile
     private var terminated = false
@@ -1058,8 +1071,6 @@ private class RfcommLinkChannel(
     override val closeReason: String? get() = terminationReason
     override val isCancelled: Boolean get() = locallyCancelled
 
-    private var readySignalled = false
-
     /** 逐帧摘要日志预算（每方向每连接，防刷屏）。 */
     private var rxFrameLogs = 0
     private var txFrameLogs = 0
@@ -1069,11 +1080,16 @@ private class RfcommLinkChannel(
     init {
         engine.hudLog = log
         engine.onDetectionRestart = {
+            endpointSource.retire()
+            linkGeneration++
+            endpointSource = Iap2EndpointGeneration()
             log("LINK: DETECT restart; retain RFCOMM, clear old control queue and sequence/window state")
+            readyLatch.countDown()
+            readyLatch = CountDownLatch(1)
             files.clear()
             controls.clear()
             // Empty payload is an ordered CSM parser boundary, distinct from POISON by identity.
-            controls.offer(ByteArray(0))
+            controls.offer(RESTART)
         }
         engine.onPeerSynchronizationAdopted = { sync ->
             log(
@@ -1113,14 +1129,33 @@ private class RfcommLinkChannel(
         }
     }
 
-    override fun awaitReady(timeoutMillis: Long): Boolean {
-        try {
-            if (!readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
-        } catch (error: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw InterruptedIOException("iAP2 链路协商已取消").apply { initCause(error) }
+    override fun awaitReady(timeoutMillis: Long): Boolean = awaitReadyGeneration(timeoutMillis) != null
+
+    override fun endpointGeneration(expected: Long): Iap2EndpointGeneration = synchronized(lock) {
+        if (linkGeneration == expected) endpointSource else Iap2EndpointGeneration().apply { retire() }
+    }
+
+    override fun awaitReadyGeneration(timeoutMillis: Long): Long? {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (true) {
+            val latch = synchronized(lock) {
+                if (terminated) return null
+                if (engine.state == Iap2LinkEngine.State.NORMAL) {
+                    workerGeneration = linkGeneration
+                    controls.remove(RESTART)
+                    return linkGeneration
+                }
+                readyLatch
+            }
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return null
+            try {
+                if (!latch.await(remaining, TimeUnit.NANOSECONDS)) return null
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedIOException("iAP2 链路协商已取消").apply { initCause(error) }
+            }
         }
-        return !terminated
     }
 
     override fun peerMaxControlPayload(): Int? =
@@ -1133,10 +1168,14 @@ private class RfcommLinkChannel(
     }
 
     override val supportsFileTransfer: Boolean get() = synchronized(lock) { engine.fileTransferSession != null }
-    override val canQueueMedia: Boolean get() = synchronized(lock) { !terminated && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8 }
-    override fun recvFileTransfer(): ByteArray? = files.poll()
+    override val canQueueMedia: Boolean get() = synchronized(lock) {
+        workerCanSendLocked() && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8
+    }
+    override fun recvFileTransfer(): ByteArray? = synchronized(lock) {
+        if (workerCanSendLocked()) files.poll() else null
+    }
     override fun sendFileTransfer(bytes: ByteArray): Boolean = synchronized(lock) {
-        if (terminated) return@synchronized false
+        if (!workerCanSendLocked()) return@synchronized false
         engine.sendFileTransfer(bytes, nowMillis()).also { drainOutputLocked() }
     }
 
@@ -1147,12 +1186,15 @@ private class RfcommLinkChannel(
 
     override fun sendHudControl(bytes: ByteArray, awaitAck: Boolean, messageId: Int): Boolean {
         synchronized(lock) {
-            if (terminated) return false
+            if (!workerCanSendLocked()) return false
             val accepted = engine.sendControl(bytes, nowMillis(), awaitAck, hudMessageId = messageId)
             drainOutputLocked()
             return accepted
         }
     }
+
+    private fun workerCanSendLocked(): Boolean = !terminated &&
+        workerGeneration == linkGeneration && engine.state == Iap2LinkEngine.State.NORMAL
 
     override fun recvControl(timeoutMillis: Long): ByteArray? {
         val polled =
@@ -1272,10 +1314,7 @@ private class RfcommLinkChannel(
     }
 
     private fun signalReadyLocked() {
-        if (!readySignalled && engine.state == Iap2LinkEngine.State.NORMAL) {
-            readySignalled = true
-            readyLatch.countDown()
-        }
+        if (engine.state == Iap2LinkEngine.State.NORMAL) readyLatch.countDown()
     }
 
     /** 可重入（close 可能从任意线程调用）：置终止位、清队列、关 socket。 */
@@ -1304,6 +1343,7 @@ private class RfcommLinkChannel(
 
         /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
         val POISON = ByteArray(0)
+        val RESTART = ByteArray(0)
     }
 }
 

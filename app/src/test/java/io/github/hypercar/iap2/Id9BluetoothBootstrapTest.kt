@@ -2,6 +2,7 @@ package io.github.hypercar.iap2
 
 import io.github.hypercar.headunit.HeadUnitProfiles
 import io.github.hypercar.headunit.HeadUnitProfile
+import java.io.IOException
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.Before
@@ -75,7 +76,10 @@ class Id9BluetoothBootstrapTest {
         }
     }
 
-    @Before fun resetCache() { MfiCertificateCache.clearAll(null) }
+    @Before fun resetMfiState() {
+        MfiCertificateCache.clearAll(null)
+        MfiLengthMemory.clearAll(null)
+    }
     private class Channel(
         val serial: ByteArray? = null,
         val certificate: ByteArray = MfiCacheFixture.certificate,
@@ -164,20 +168,23 @@ class Id9BluetoothBootstrapTest {
         assertEquals(1,ids.count { it==0x4e0d })
         assertFalse(0x5702 in ids)
     }
-    @Test fun id85LegacyWifiStartsWithTheBoxGreetingSequenceAndDoesNotRepeatWirelessUpdate() {
-        val channel = Channel(legacy = true)
-        Iap2SenderSession(channel,{},deviceName="fixture-phone",onEndpoint={},
-            profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
-        val ids = channel.sent.map { it.messageId }
-        assertEquals(listOf(0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b),
-            ids.drop(ids.indexOf(0xaa05)+1).take(5))
-        assertTrue(ids.indexOf(0x5702)>ids.indexOf(0x4e0b))
-        assertEquals(1,ids.count { it==0x4e0d })
-        assertArrayEquals(Iap2Csm.u8(0,1),channel.sent.single { it.messageId==0x4e0d }.body)
-        assertArrayEquals(Iap2Csm.string(0,"fixture-phone"),channel.sent.single { it.messageId==0x4e09 }.body)
+    @Test fun mguAndMotorcycleLegacyWifiUseTheSameBoxGreetings() {
+        for (profile in listOf(HeadUnitProfiles.BMW_ID85, HeadUnitProfiles.MOTORCYCLE)) {
+            val channel = Channel(legacy = true)
+            Iap2SenderSession(channel, {}, deviceName = "fixture-phone", onEndpoint = {},
+                profile = profile, nanoTime = { channel.time }).run(10_000)
+            val ids = channel.sent.map { it.messageId }
+            assertEquals(profile.id, listOf(0x4e0c, 0x4e0d, 0x4e0a, 0x4e09, 0x4e0b),
+                ids.drop(ids.indexOf(0xaa05) + 1).take(5))
+            assertTrue(ids.indexOf(0x5702) > ids.indexOf(0x4e0b))
+            assertEquals(1, ids.count { it == 0x4e0d })
+            assertArrayEquals(Iap2Csm.u8(0, 1), channel.sent.single { it.messageId == 0x4e0d }.body)
+            assertArrayEquals(Iap2Csm.string(0, "fixture-phone"), channel.sent.single { it.messageId == 0x4e09 }.body)
+        }
     }
-    @Test fun onlyId85MovesWirelessUpdateIntoLegacyGreetings() {
-        for (profile in HeadUnitProfiles.builtin.filter { it.id!="bmw_id85" }) {
+    @Test fun otherProtocolsKeepWirelessUpdateAfterLegacyGreetings() {
+        val boxProfiles = setOf(HeadUnitProfiles.BMW_ID85.id, HeadUnitProfiles.MOTORCYCLE.id)
+        for (profile in HeadUnitProfiles.builtin.filter { it.id !in boxProfiles }) {
             val channel = Channel(legacy = true)
             Iap2SenderSession(channel,{},onEndpoint={},profile=profile,nanoTime={channel.time}).run(10_000)
             val ids = channel.sent.map { it.messageId }
@@ -197,6 +204,53 @@ class Id9BluetoothBootstrapTest {
         Iap2SenderSession(channel,{},onEndpoint={},receiverAddress=peer,
             profile=if(id9) HeadUnitProfiles.BMW_ID9 else HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
     }
+
+    @Test fun compatibilityChallengeUsesOnlyTheCertificateParameterLengthIncludingItsHeader() {
+        val otherParameter = Iap2Csm.param(1, ByteArray(64))
+        val atThreshold = Channel(certificate = otherParameter + Iap2Csm.param(0, ByteArray(640)))
+        run(atThreshold)
+        assertEquals(listOf(32), challengeLengths(atThreshold))
+
+        val aboveThreshold = Channel(certificate = otherParameter + Iap2Csm.param(0, ByteArray(641)))
+        run(aboveThreshold, peer = "00:11:22:33:44:66")
+        assertEquals(listOf(20), challengeLengths(aboveThreshold))
+    }
+
+    @Test fun compatibilityChallengeRetainsTheOtherLengthsWhenTheCertificatePreferenceIsSilent() {
+        val channel = Channel(certificate = Iap2Csm.param(0, ByteArray(641)), signature = null)
+        run(channel)
+        assertEquals(listOf(20, 32, 16), challengeLengths(channel))
+    }
+
+    @Test fun rememberedSuccessfulChallengeTakesPrecedenceOverTheCertificateLength() {
+        run(Channel(certificate = Iap2Csm.param(0, ByteArray(640))))
+        val channel = Channel(certificate = Iap2Csm.param(0, ByteArray(641)))
+        run(channel)
+        assertEquals(listOf(32), challengeLengths(channel))
+    }
+
+    @Test fun rememberedDisconnectStillRotatesToTheNextEstablishedCandidate() {
+        val peer = "00:11:22:33:44:55"
+        val key = MfiLengthMemory.receiverKey("BMW-fixture IDC23-fixture BMW Group", peer)
+        MfiLengthMemory.recordDisconnected(null, key, 20)
+        val channel = Channel(certificate = Iap2Csm.param(0, ByteArray(641)))
+        run(channel, peer)
+        assertEquals(listOf(16), challengeLengths(channel))
+    }
+
+    @Test fun malformedCertificateCannotSetTheChallengeLength() {
+        val parameter = Iap2Csm.param(0, ByteArray(641))
+        for (certificate in listOf(parameter + byteArrayOf(0), parameter + Iap2Csm.param(0, byteArrayOf(1)))) {
+            val channel = Channel(certificate = certificate)
+            assertThrows(IOException::class.java) { run(channel) }
+            assertTrue(challengeLengths(channel).isEmpty())
+        }
+    }
+
+    private fun challengeLengths(channel: Channel): List<Int> = channel.sent
+        .filter { it.messageId == Iap2MessageIds.MFI_REQUEST_CHALLENGE }
+        .map { Iap2Csm.parseParams(it.body).single().value.size }
+
     @Test fun firstConnectionFetchesCertificateAndNextUsesSerialCacheButStillChallenges() {
         val first=Channel(serial=MfiCacheFixture.serial);run(first)
         assertEquals(2,first.sent.count { it.messageId==0xaa00 })
