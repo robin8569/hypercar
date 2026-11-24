@@ -1,0 +1,124 @@
+# 上游 fw867/hypercar 发新版本 → 自动合进 carplus-ocar，版本号与上游保持一致，
+# 然后显式触发 Build Release APK 出正式包并发布 Release。
+#
+# 三个设计要点：
+#   1. 版本号只认上游：功能分支**不要**自己改 version.properties。同步时上游的
+#      versionName / versionCode 会随合并进来，所以我们的 release tag 与上游同名同号。
+#   2. GITHUB_TOKEN 推的 commit 不会触发其它 workflow（GitHub 的防递归机制），
+#      所以合并完必须显式 `gh workflow run android-ci.yml`，不要指望 push 自己触发。
+#   3. 合并冲突不可能自动解决：冲突就中止 + 开 issue，绝不硬合、绝不带冲突出包。
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天 10:00（CST）检查一次上游
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '同步后是否顺带发布 Release'
+        type: boolean
+        default: true
+      force:
+        description: '版本号相同也走一遍（用于验证 dispatch 链路，不会重复合并代码）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 同步上游并触发正式出包
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出功能分支
+        uses: actions/checkout@v4
+        with:
+          ref: carplus-ocar
+          fetch-depth: 0
+
+      - name: 取上游 main
+        run: |
+          set -eu
+          git remote add upstream https://github.com/fw867/hypercar.git
+          git fetch upstream main --tags
+
+      - name: 比较版本号
+        id: cmp
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          up=$(git show upstream/main:version.properties | sed -n 's/^versionName=//p')
+          cur=$(sed -n 's/^versionName=//p' version.properties)
+          echo "上游 versionName=$up，本分支 versionName=$cur"
+          need=false
+          if [ "$up" != "$cur" ]; then need=true; fi
+          case "${FORCE:-false}" in true|True) need=true; echo "force=true，强制走一遍链路" ;; esac
+          echo "need=$need" >> "$GITHUB_OUTPUT"
+          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+
+      - name: 合并上游（无冲突才推）
+        if: steps.cmp.outputs.need == 'true'
+        id: merge
+        run: |
+          set -eu
+          git config user.name "hypercar-sync"
+          git config user.email "sync@users.noreply.github.com"
+          if ! git merge --no-ff upstream/main \
+              -m "sync(upstream): 合并上游 v${{ steps.cmp.outputs.upstream }}"; then
+            echo "::warning::与上游 v${{ steps.cmp.outputs.upstream }} 存在冲突，已中止合并"
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          git push origin HEAD:carplus-ocar
+
+      - name: 冲突时开 issue 通知
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.cmp.outputs.upstream }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # 正文用引号 heredoc，避免被 shell 展开
+          BODY=$(cat <<'TEXT'
+          自动同步在本机尝试把上游合并进 `carplus-ocar` 时发生冲突，已中止，**没有出包**。
+
+          处理方式：
+
+          1. 本地 `git fetch upstream main` 后 `git merge upstream/main`，手工解决冲突（多半在
+             `HyperCarRepo.kt`、`StartupRequirements.kt`、`SettingsScreen.kt`）。
+          2. 为保证版本号与上游一致，`version.properties` **一律取上游版本**：
+             `git checkout --theirs version.properties`（或直接照抄上游值）。
+          3. 解决后 `git push origin carplus-ocar`，再到 Actions 手动跑一次
+             `Build Release APK`（勾选 publish）。
+          TEXT
+          )
+          gh issue create \
+            --repo "$REPO" \
+            --title "上游 v${VERSION} 合并冲突，需要手工解" \
+            --body "$BODY"
+          echo "::error::上游 v${VERSION} 合并冲突，已开 issue"
+          exit 1
+
+      - name: 触发正式出包
+        if: steps.cmp.outputs.need == 'true' && steps.merge.outputs.conflict != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -eu
+          # workflow_dispatch 的 publish 输入决定是否发 Release；定时触发时默认发
+          WANT="${PUBLISH:-true}"
+          case "$WANT" in true|True) PUBLISH_FLAG=true ;; *) PUBLISH_FLAG=false ;; esac
+          gh workflow run android-ci.yml --ref carplus-ocar -f publish="$PUBLISH_FLAG"
+          echo "已触发 Build Release APK（publish=$PUBLISH_FLAG），版本 v${{ steps.cmp.outputs.upstream }}"
