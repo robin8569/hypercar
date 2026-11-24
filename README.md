@@ -1,4 +1,4 @@
-# HyperCar
+# HyperCar-在原版基础上加了OPPO car+支持。 [感谢@fw867](https://github.com/fw867/hypercar/releases/latest)
 
 让 Android 手机连接无线 CarPlay 车机，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。支持 **自绘车机 UI**、**小米 CarWith** 与 **OPPO Car+ 车联** 三种画面来源，无需 root。
 
