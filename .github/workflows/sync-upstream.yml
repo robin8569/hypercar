@@ -1,17 +1,26 @@
-# 上游 fw867/hypercar 发新版本 → 自动合进 carplus-ocar，版本号与上游保持一致，
-# 然后显式触发 Build Release APK 出正式包并发布 Release。
+# 实时同步上游 fw867/hypercar：每 10 分钟比对一次版本号，
+# 上游一发新版就把上游合进 carplus-ocar，版本号沿用上游（tag 与主线同名同号），
+# 再显式触发 Build Release APK 出正式包并发布 Release。
 #
-# 三个设计要点：
-#   1. 版本号只认上游：功能分支**不要**自己改 version.properties。同步时上游的
-#      versionName / versionCode 会随合并进来，所以我们的 release tag 与上游同名同号。
-#   2. GITHUB_TOKEN 推的 commit 不会触发其它 workflow（GitHub 的防递归机制），
-#      所以合并完必须显式 `gh workflow run android-ci.yml`，不要指望 push 自己触发。
-#   3. 合并冲突不可能自动解决：冲突就中止 + 开 issue，绝不硬合、绝不带冲突出包。
+# 四个设计要点：
+#   1. 便宜：首步只用两个 HTTP 请求读 version.properties（raw.githubusercontent），
+#      不 checkout、不 clone。版本一样就直接退出，整轮约 15 秒。
+#   2. 自愈：判定条件不是「版本不同」，而是「版本不同 或 当前版本还没有对应 Release」，
+#      这样某次 dispatch 失败、构建被取消造成的漏发，下一轮（≤10 分钟）自动补上。
+#   3. GITHUB_TOKEN 推的 commit 不会触发其它 workflow（GitHub 防递归机制），
+#      所以合并完必须显式 `gh workflow run android-ci.yml`。
+#   4. 合并冲突不可能自动解决：冲突就中止 + 尽力开 issue，绝不硬合、绝不带冲突出包。
+#
+# 可选 Secret：SYNC_TOKEN（fine-grained PAT，Contents: write + Workflows: write）。
+#   - 不配也能用默认 GITHUB_TOKEN；唯一限制是：上游若改动了 .github/workflows/**，
+#     用 GITHUB_TOKEN 推不动这类文件，推送会被拒（run 会红并明确报错）。
+#   - 配了之后推送走 PAT，push 本身也会触发一次构建（会被下面的 dispatch 按
+#     concurrency 规则合并成一次出包）。
 name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 2 * * *' # 每天 10:00（CST）检查一次上游
+    - cron: '*/10 * * * *' # 每 10 分钟比对一次（GitHub 最短调度粒度是 5 分钟）
   workflow_dispatch:
     inputs:
       publish:
@@ -19,7 +28,7 @@ on:
         type: boolean
         default: true
       force:
-        description: '版本号相同也走一遍（用于验证 dispatch 链路，不会重复合并代码）'
+        description: '版本相同且已有 Release 也走一遍（仅用于验证 dispatch 链路）'
         type: boolean
         default: false
 
@@ -30,47 +39,69 @@ permissions:
 
 concurrency:
   group: sync-upstream
-  cancel-in-progress: false
+  cancel-in-progress: false # 合并过程中不要被下一轮打断
+
+env:
+  UPSTREAM: fw867/hypercar
+  BRANCH: carplus-ocar
 
 jobs:
   sync:
-    name: 同步上游并触发正式出包
+    name: 实时同步上游并触发正式出包
     runs-on: ubuntu-latest
     steps:
+      - name: 比对版本与 Release（不 checkout）
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          up=$(curl -fsSL --retry 3 --retry-delay 1 \
+            "https://raw.githubusercontent.com/${UPSTREAM}/main/version.properties" \
+            | sed -n 's/^versionName=//p')
+          cur=$(curl -fsSL --retry 3 --retry-delay 1 \
+            "https://raw.githubusercontent.com/${REPO}/${BRANCH}/version.properties" \
+            | sed -n 's/^versionName=//p')
+          if [ -z "$up" ] || [ -z "$cur" ]; then
+            echo "::error::读不到版本号（上游=$up 分支=$cur）"
+            exit 1
+          fi
+          echo "上游 versionName=$up，分支 versionName=$cur"
+
+          merge=false
+          [ "$up" != "$cur" ] && merge=true
+          build=$merge
+          if [ "$build" = "false" ] && ! gh release view "v${cur}" --repo "$REPO" >/dev/null 2>&1; then
+            echo "v${cur} 还没有对应 Release，补发一次（自愈）"
+            build=true
+          fi
+          case "${FORCE:-false}" in true|True) build=true; echo "force=true，强制走一遍链路" ;; esac
+
+          {
+            echo "upstream=$up"
+            echo "merge=$merge"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 检出功能分支
+        if: steps.cmp.outputs.build == 'true'
         uses: actions/checkout@v4
         with:
           ref: carplus-ocar
           fetch-depth: 0
-
-      - name: 取上游 main
-        run: |
-          set -eu
-          git remote add upstream https://github.com/fw867/hypercar.git
-          git fetch upstream main --tags
-
-      - name: 比较版本号
-        id: cmp
-        env:
-          FORCE: ${{ inputs.force }}
-        run: |
-          set -eu
-          up=$(git show upstream/main:version.properties | sed -n 's/^versionName=//p')
-          cur=$(sed -n 's/^versionName=//p' version.properties)
-          echo "上游 versionName=$up，本分支 versionName=$cur"
-          need=false
-          if [ "$up" != "$cur" ]; then need=true; fi
-          case "${FORCE:-false}" in true|True) need=true; echo "force=true，强制走一遍链路" ;; esac
-          echo "need=$need" >> "$GITHUB_OUTPUT"
-          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: 合并上游（无冲突才推）
-        if: steps.cmp.outputs.need == 'true'
+        if: steps.cmp.outputs.merge == 'true'
         id: merge
         run: |
           set -eu
           git config user.name "hypercar-sync"
           git config user.email "sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+          git fetch upstream main --tags
           if ! git merge --no-ff upstream/main \
               -m "sync(upstream): 合并上游 v${{ steps.cmp.outputs.upstream }}"; then
             echo "::warning::与上游 v${{ steps.cmp.outputs.upstream }} 存在冲突，已中止合并"
@@ -79,12 +110,15 @@ jobs:
             exit 0
           fi
           echo "conflict=false" >> "$GITHUB_OUTPUT"
-          git push origin HEAD:carplus-ocar
+          if ! git push origin "HEAD:${BRANCH}"; then
+            echo "::error::推送合并结果失败。若报 workflow 权限错误，说明上游改动了 .github/workflows/**：GITHUB_TOKEN 推不动这类文件，配置 Secret SYNC_TOKEN（fine-grained PAT，Contents: write + Workflows: write）即可。"
+            exit 1
+          fi
 
       - name: 冲突时开 issue 通知
         if: steps.merge.outputs.conflict == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
           VERSION: ${{ steps.cmp.outputs.upstream }}
           REPO: ${{ github.repository }}
         run: |
@@ -102,14 +136,17 @@ jobs:
           exit 1
 
       - name: 触发正式出包
-        if: steps.cmp.outputs.need == 'true' && steps.merge.outputs.conflict != 'true'
+        if: steps.cmp.outputs.build == 'true' && steps.merge.outputs.conflict != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
           PUBLISH: ${{ inputs.publish }}
+          VERSION: ${{ steps.cmp.outputs.upstream }}
         run: |
           set -eu
-          # workflow_dispatch 的 publish 输入决定是否发 Release；定时触发时默认发
           WANT="${PUBLISH:-true}"
           case "$WANT" in true|True) PUBLISH_FLAG=true ;; *) PUBLISH_FLAG=false ;; esac
-          gh workflow run android-ci.yml --ref carplus-ocar -f publish="$PUBLISH_FLAG"
-          echo "已触发 Build Release APK（publish=$PUBLISH_FLAG），版本 v${{ steps.cmp.outputs.upstream }}"
+          if ! gh workflow run android-ci.yml --ref "${BRANCH}" -f publish="$PUBLISH_FLAG"; then
+            echo "::error::触发 Build Release APK 失败（创建 workflow_dispatch 事件被拒）。检查本 workflow 是否声明 actions: write，以及仓库 Settings → Actions → General 的 Workflow permissions 是否为 Read and write。"
+            exit 1
+          fi
+          echo "已触发 Build Release APK（publish=$PUBLISH_FLAG），目标版本 v${VERSION}"
