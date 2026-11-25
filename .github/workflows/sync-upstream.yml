@@ -74,10 +74,29 @@ jobs:
           [ "$up" != "$cur" ] && merge=true
           build=$merge
           if [ "$build" = "false" ] && ! gh release view "v${cur}" --repo "$REPO" >/dev/null 2>&1; then
-            echo "v${cur} 还没有对应 Release，补发一次（自愈）"
+            echo "v${cur} 还没有对应 Release，准备补发一次（自愈）"
             build=true
           fi
           case "${FORCE:-false}" in true|True) build=true; echo "force=true，强制走一遍链路" ;; esac
+
+          # 自愈必须有刹车，否则一旦构建持续失败就会每 10 分钟重试一次、烧满 CI。
+          # 只在「仅补发、不合并」的路径上刹车：合并出的是新提交，本来就该重跑构建。
+          if [ "$build" = "true" ] && [ "$merge" = "false" ]; then
+            SHA=$(gh api "repos/${REPO}/commits/${BRANCH}" --jq .sha)
+            active=$(gh run list --repo "$REPO" --workflow android-ci.yml --branch "$BRANCH" --limit 20 \
+              --json headSha,status \
+              --jq "[.[]|select(.headSha==\"${SHA}\" and (.status==\"queued\" or .status==\"in_progress\"))]|length")
+            failed=$(gh run list --repo "$REPO" --workflow android-ci.yml --branch "$BRANCH" --limit 20 \
+              --json headSha,status,conclusion \
+              --jq "[.[]|select(.headSha==\"${SHA}\" and .status==\"completed\" and .conclusion!=\"success\" and .conclusion!=\"cancelled\")]|length")
+            if [ "${active:-0}" -gt 0 ]; then
+              echo "::notice::该提交已有构建在排队/运行中，本轮不重复触发"
+              build=false
+            elif [ "${failed:-0}" -ge 2 ]; then
+              echo "::warning::该提交的构建已连续失败 ${failed} 次，暂停自动补发，请人工看失败的 run（补发上限 2 次/提交）"
+              build=false
+            fi
+          fi
 
           {
             echo "upstream=$up"
