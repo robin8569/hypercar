@@ -5313,30 +5313,50 @@ object HyperCarRepo {
             ?: return "未安装 Car+ 车联（候选 ${CarPlusSource.PACKAGES.joinToString("/")}）"
         log("CARPLUS: ${CarPlusSource.describe(ctx, pkg)}")
         log("CARPLUS: ${CarPlusSource.packageSnapshot()}")
-        SettingsStore.carPlusComponent?.let { override ->
-            val component = CarPlusSource.resolve(ctx, pkg, override)
-                ?: return "pkg=$pkg 未解析到可启动的 Activity（override=$override）"
-            log("CARPLUS: 入口 ${component.flattenToShortString()} override=$override")
-            val status = launchCarPlusComponent(ctx, attempt, component)
-            return if (carWithEntries.current(attempt)) status else "已跳过过期 Car+ 启动 attempt=$attempt"
-        }
-        // 未指定入口：按分数逐个试。CarlifeActivity 这类主投屏页可能还要“已连接配件”才开会话，
-        // 因此以 7240 是否进入 LISTEN 为准；命中就记住该组件，下次直接启动。
-        val sweep = CarPlusSource.sweepList(ctx, pkg)
-        if (sweep.isEmpty()) return "pkg=$pkg 没有可启动的导出 Activity"
-        log("CARPLUS: 未指定入口，开始候选扫描（${sweep.size} 个，各等 3s 看 7240）")
-        for ((index, candidate) in sweep.withIndex()) {
-            if (!carWithEntries.current(attempt)) return "已跳过过期 Car+ 扫描 attempt=$attempt"
-            val component = android.content.ComponentName(pkg, candidate.className)
-            val status = launchCarPlusComponent(ctx, attempt, component)
-            kotlinx.coroutines.delay(3_000)
-            if (!carWithEntries.current(attempt)) return "已跳过过期 Car+ 扫描 attempt=$attempt"
-            val listen = CarPlusSource.listeningOn7240()
-            log("CARPLUS-SWEEP: try=${index + 1}/${sweep.size} " +
-                "${component.flattenToShortString()} listen=${listen?.toString() ?: "unknown"} $status")
-            if (listen == true) {
+        fun alive() = carWithEntries.current(attempt)
+        fun remember(component: android.content.ComponentName) {
+            if (SettingsStore.carPlusComponent != component.flattenToString()) {
                 SettingsStore.carPlusComponent = component.flattenToString()
-                log("CARPLUS-SWEEP: 命中并记住入口 ${component.flattenToShortString()}")
+                log("CARPLUS: 记住入口 ${component.flattenToShortString()}")
+            }
+        }
+        // 单发优先：记忆值 > 硬化常量 > 最高分候选。只拉起一次，再看 7240 有没有 LISTEN。
+        val hardened = CarPlusSource.hardened(ctx, pkg)
+        val remembered = SettingsStore.carPlusComponent?.let { CarPlusSource.resolve(ctx, pkg, it) }
+        val first = remembered ?: hardened ?: CarPlusSource.resolve(ctx, pkg, null)
+        if (first == null) return "pkg=$pkg 没有可启动的导出 Activity"
+        val origin = when {
+            remembered != null -> "remembered"
+            hardened != null -> "hardened"
+            else -> "top_score"
+        }
+        log("CARPLUS: 单发入口 ${first.flattenToShortString()} source=$origin")
+        val status = launchCarPlusComponent(ctx, attempt, first)
+        if (!alive()) return "已跳过过期 Car+ 启动 attempt=$attempt"
+        val firstListen = CarPlusSource.awaitListening(alive = ::alive)
+        log("CARPLUS-SINGLE: ${first.flattenToShortString()} " +
+            "listen=${firstListen?.toString() ?: "unknown"} $status")
+        if (firstListen == true) {
+            remember(first)
+            return "single hit ${first.flattenToShortString()}"
+        }
+        if (firstListen == null) return "7240 状态未知（Shizuku 未就绪），按单发结果处理 $status"
+        // 单发没起来（Car+ 升级换了类名等）：降级扫剩余候选，最多 3 个，命中即记住。
+        val sweep = CarPlusSource.sweepList(ctx, pkg)
+            .filter { android.content.ComponentName(pkg, it.className) != first }
+            .take(3)
+        if (sweep.isEmpty()) return "单发未命中且没有备用候选 $status"
+        log("CARPLUS: 单发未命中 7240，降级扫描 ${sweep.size} 个备用候选")
+        for ((index, candidate) in sweep.withIndex()) {
+            if (!alive()) return "已跳过过期 Car+ 扫描 attempt=$attempt"
+            val component = android.content.ComponentName(pkg, candidate.className)
+            val candidateStatus = launchCarPlusComponent(ctx, attempt, component)
+            if (!alive()) return "已跳过过期 Car+ 扫描 attempt=$attempt"
+            val listen = CarPlusSource.awaitListening(alive = ::alive)
+            log("CARPLUS-SWEEP: try=${index + 1}/${sweep.size} " +
+                "${component.flattenToShortString()} listen=${listen?.toString() ?: "unknown"} $candidateStatus")
+            if (listen == true) {
+                remember(component)
                 return "sweep hit ${component.flattenToShortString()}"
             }
         }

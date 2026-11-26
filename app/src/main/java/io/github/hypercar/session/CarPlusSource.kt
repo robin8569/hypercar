@@ -25,6 +25,14 @@ import io.github.hypercar.shizuku.ShizukuTools
  */
 internal object CarPlusSource {
 
+    /**
+     * 已实机确认的硬化入口（ColorOS 17 / Car+ 17.32.x）：`com.oplus.ocar/.CarlifeActivity`。
+     *
+     * 上游 CarWith 之所以能单发，是因为入口是已知常量；这里把探测结果同样固化成常量，
+     * 连接路径上默认只拉起这一次，等 7240 进入 LISTEN；失败才降级扫候选。
+     */
+    val HARDENED = ComponentName("com.oplus.ocar", "com.oplus.ocar.CarlifeActivity")
+
     /** 常见包名，按可能性排序（ColorOS 各版本命名不一致；com.oplus.ocar 为现行包名）。 */
     val PACKAGES = listOf(
         "com.oplus.ocar",
@@ -105,6 +113,30 @@ internal object CarPlusSource {
             )
         }.getOrNull() ?: return null
         return (result.out.trim().toIntOrNull() ?: 0) > 0
+    }
+
+    /** 硬化入口只在确实存在于该包清单里时才直接使用，避免给不存在的组件发 am start。 */
+    fun hardened(ctx: Context, pkg: String): ComponentName? {
+        if (pkg != HARDENED.packageName) return null
+        val present = candidates(ctx, pkg).any { it.className == HARDENED.className }
+        return if (present) HARDENED else null
+    }
+
+    /**
+     * 轮询 7240 是否 LISTEN（只读 `/proc/net/tcp`，不消耗真实连接）：命中立刻返回，
+     * 不做固定睡眠。返回 null 表示 Shizuku 未就绪、状态未知。
+     */
+    suspend fun awaitListening(
+        timeoutMillis: Long = 3_000,
+        stepMillis: Long = 300,
+        alive: () -> Boolean = { true },
+    ): Boolean? {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (true) {
+            val listening = listeningOn7240()
+            if (listening == true || !alive() || System.currentTimeMillis() >= deadline) return listening
+            kotlinx.coroutines.delay(stepMillis)
+        }
     }
 
     /** 已安装的 CarLife / Car+ 相关包，用来判断“没有 CarLife 组件”还是“入口没选对”。 */
