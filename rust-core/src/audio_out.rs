@@ -229,6 +229,7 @@ pub struct AudioOut {
     /** 同步包套接字（调用方 connect 好到车机 controlPort；车机没下发时为 None）。 */
     sync: Option<std::sync::Arc<UdpSocket>>,
     control_observer: Option<crate::audio_diagnostics::ControlObserver>,
+    port_refusal: Option<tokio::sync::watch::Sender<Option<Instant>>>,
     d4: Option<crate::audio_diagnostics::D4Trace>,
     rtp_position: Option<(Arc<crate::audio_diagnostics::RtpPosition>, tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>)>,
     #[cfg(test)]
@@ -292,6 +293,7 @@ impl AudioOut {
             transport,
             sync: sync.map(std::sync::Arc::new),
             control_observer: None,
+            port_refusal: None,
             d4: None,
             rtp_position: None,
             #[cfg(test)]
@@ -357,6 +359,10 @@ impl AudioOut {
         let mut output=Self::new(data,sync,key,stream_type);
         output.sample_rate=encoder.sample_rate();output.opus=Some(encoder);Ok(output)
     }
+    pub(crate) fn set_resend_active(&self, active: bool) {
+        if let Some(observer) = &self.control_observer { observer.set_resend_active(active); }
+    }
+
     pub(crate) fn offload_aac(&mut self, ownership: &crate::buffered_ownership::BufferedOwnership) -> std::io::Result<()> {
         if let Some(encoder) = self.aac.take() {
             self.aac_input_ts = self.ts;
@@ -371,6 +377,10 @@ impl AudioOut {
             Ok(pcm.chunks_exact(crate::aac::FRAMES * CHANNELS)
                 .map(|unit| unit.iter().flat_map(|sample| sample.to_be_bytes()).collect()).collect())
         }).unwrap());
+    }
+
+    pub(crate) fn track_port_refusals(&mut self) {
+        self.port_refusal = Some(tokio::sync::watch::Sender::new(None));
     }
 
     pub(crate) fn observe_main_stream(&mut self, rtsp: u64, stream_id: i64, peer_port: u16,
@@ -391,11 +401,11 @@ impl AudioOut {
         match (&self.sync, listening) {
             (Some(socket), _) => {
                 self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(
-                    socket.clone(), label, ownership.subscribe(), self.pt == 100, None));
+                    socket.clone(), label, ownership.subscribe(), self.pt == 100, None, self.port_refusal.clone(), false));
             }
             (None, Some((socket, peer))) => {
                 self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(
-                    Arc::new(socket), label, ownership.subscribe(), self.pt == 100, Some(peer)));
+                    Arc::new(socket), label, ownership.subscribe(), self.pt == 100, Some(peer), None, false));
             }
             (None, None) => {
                 let reason = if peer_port == 0 { "no_control_port" } else { "socket_unavailable" };
@@ -416,6 +426,7 @@ impl AudioOut {
                 stream_type: self.stream_type(), rate: self.sample_rate },
             high_accuracy: self.high_accuracy_timestamps,
             position: Arc::downgrade(position),
+            port_refusal: self.port_refusal.as_ref().map(|signal| signal.subscribe()),
         })
     }
 
@@ -543,8 +554,9 @@ impl AudioOut {
         self.send_pcm_for_generation(frames, self.buffered_loss_generation()).await
     }
 
-    pub(crate) async fn send_call_audio(&mut self, payload: &[u8], frames: u32, loss_generation: u64) -> std::io::Result<()> {
-        self.send_payload(payload, frames, Some(loss_generation)).await
+    pub(crate) async fn send_call_audio(&mut self, payload: &[u8], frames: u32, loss_generation: u64,
+        phone_endpoint: std::os::fd::RawFd) -> std::io::Result<()> {
+        self.send_payload_checked(payload, frames, Some(loss_generation), Some(phone_endpoint)).await
     }
 
     pub async fn send_pcm_for_generation(&mut self, frames: &[i16], expected_generation: Option<u64>) -> std::io::Result<()> {
@@ -776,6 +788,11 @@ impl AudioOut {
     }
 
     async fn send_payload(&mut self, payload: &[u8], sample_frames: u32, rtp_generation: Option<u64>) -> std::io::Result<()> {
+        self.send_payload_checked(payload, sample_frames, rtp_generation, None).await
+    }
+
+    async fn send_payload_checked(&mut self, payload: &[u8], sample_frames: u32, rtp_generation: Option<u64>,
+        phone_endpoint: Option<std::os::fd::RawFd>) -> std::io::Result<()> {
         let ownership_generation = self.pcm_tick_due.and_then(|_| self.pcm_ownership.as_ref().map(|rx| rx.borrow().losses));
         // Recheck ownership after encoding; a resource handover may occur concurrently.
         if !self.owns_audio() {
@@ -813,6 +830,10 @@ impl AudioOut {
                 self.marker_pending = true;
                 return Ok(());
             }
+            if let Some(phone_endpoint) = phone_endpoint {
+                crate::call_audio::check_phone_endpoint(phone_endpoint)
+                    .map_err(|reason| std::io::Error::new(std::io::ErrorKind::BrokenPipe, reason))?;
+            }
             socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT)
         };
         // A rejected generation never reaches the kernel. Consume the nonce only
@@ -831,6 +852,7 @@ impl AudioOut {
             costs.udp.observe(crate::audio_pacing::StageSpan::since(started));
         }
         if let Err(error) = sent {
+            crate::audio_diagnostics::observe_port_refusal(self.port_refusal.as_ref(), &error);
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
                 let mono_ns = crate::timing::monotonic_nanos();
@@ -903,6 +925,9 @@ impl AudioOut {
         let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, frames);
         // Sync shares the audio pump with media. A full socket must not stall the next tick.
         let result = socket2::SockRef::from(sync).send_with_flags(&packet, libc::MSG_DONTWAIT);
+        if let Err(error) = &result {
+            crate::audio_diagnostics::observe_port_refusal(self.port_refusal.as_ref(), error);
+        }
         if let Some(d4) = &mut self.d4 { d4.written(&result, packet.len()); }
         if let (Some(trace), Some(generation)) = (&mut self.resume_trace, generation) {
             trace.observe_unborrow(generation, true);
@@ -1151,6 +1176,7 @@ mod ownership_tests {
         let mut audio = AudioOut::new(data, Some(sync), [7; 32], 102);
         audio.seq = u16::MAX;
         audio.observe_main_stream(9, 23, control_peer.local_addr().unwrap().port(), std::time::Instant::now(), &ownership, None);
+        audio.set_resend_active(true);
 
         let mut packet = [0u8; 256];
         let mut originals = Vec::new();
@@ -1276,6 +1302,7 @@ mod ownership_tests {
         let ownership = crate::buffered_ownership::BufferedOwnership::default();
         ownership.publish(true);
         audio.observe_main_stream(9, 23, peer.port(), std::time::Instant::now(), &ownership, None);
+        audio.set_resend_active(true);
         assert!(audio.control_observer.is_some());
         assert!(audio.pacing_id.is_some());
         audio.send_sync_now(1_000_000_000).await.unwrap();
@@ -1294,6 +1321,28 @@ mod ownership_tests {
         assert_eq!(from, sync_local);
         assert_eq!(&resent[..4], &[0x80, 0xd6, len as u8, (len >> 8) as u8]);
         assert_eq!(&resent[4..n], &media[..len]);
+    }
+
+    #[tokio::test]
+    async fn call_udp_drops_buffered_pcm_if_shell_retires_before_the_write() {
+        use std::{net::Shutdown, os::{fd::AsRawFd, unix::net::UnixStream}};
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let (phone, shell) = UnixStream::pair().unwrap();
+        let mut audio = AudioOut::new_pcm(sender, None, [0; 32], 48000);
+
+        let phone_endpoint = phone.as_raw_fd();
+        audio.send_call_audio(&[6; 64], 352, 0, phone_endpoint).await.unwrap();
+        let mut wire = [0; 256];
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut wire)).await.unwrap().unwrap();
+        audio.before_rtp_write = Some(Box::new(move || shell.shutdown(Shutdown::Both).unwrap()));
+        let original_nonce = audio.nonce;
+        let result = audio.send_call_audio(&[42; 64], 352, 0, phone_endpoint).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(tokio::time::timeout(Duration::from_millis(20), receiver.recv(&mut wire)).await.is_err());
+        assert_eq!(audio.nonce, original_nonce);
     }
 
     #[tokio::test]
