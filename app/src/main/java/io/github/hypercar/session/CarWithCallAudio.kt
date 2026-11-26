@@ -9,9 +9,12 @@ import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal object CarWithCallAudio {
     private const val REBIND_INTERVAL_MS = 2_000L
+    private val monitorLock = Mutex()
 
     private class ForegroundCall(val identity: String, rate: Int) {
         val rates = CallAudioRates(rate)
@@ -26,20 +29,32 @@ internal object CarWithCallAudio {
     }
 
     suspend fun monitor(context: Context, token: Long, rate: Int, current: () -> Boolean, log: (String) -> Unit) {
+        fun armed() = current() && RustCoreBridge.nativeCallAudioArmed(token)
+        withArmedMonitor(::armed) { monitorCall(context, token, rate, ::armed, log) }
+    }
+
+    internal suspend fun withArmedMonitor(armed: () -> Boolean, monitor: suspend () -> Unit) {
+        // The shell has one endpoint slot. Keep it until the previous monitor's cleanup finishes.
+        monitorLock.withLock {
+            if (armed()) monitor()
+        }
+    }
+
+    private suspend fun monitorCall(context: Context, token: Long, rate: Int, armed: () -> Boolean, log: (String) -> Unit) {
         val audio = context.getSystemService(AudioManager::class.java) ?: return
         val owner = Binder()
         var foreground: ForegroundCall? = null
         var offerId = 0L
         var nextBindAt = 0L
-        var reportedUnavailable = false
-        fun armed() = current() && RustCoreBridge.nativeCallAudioArmed(token)
+        var reportedUnavailable: String? = null
+        fun diagnosticStatus() = runCatching { SpikeShell.callAudioStatus() }.getOrNull() ?: "shell_status_unavailable"
 
         try {
             while (armed()) {
                 val inCall = audio.mode == AudioManager.MODE_IN_CALL
                 val shellReady = inCall && ShizukuTools.isReady
                 if (!shellReady) nextBindAt = 0L
-                if (!inCall) reportedUnavailable = false
+                if (!inCall) reportedUnavailable = null
                 if (shellReady && !SpikeShell.isConnected() && SystemClock.elapsedRealtime() >= nextBindAt) {
                     foreground?.closeOffer(token)
                     foreground = null
@@ -56,22 +71,28 @@ internal object CarWithCallAudio {
                 if (!armed()) return
                 val identity = if (shellReady) runCatching { SpikeShell.activeCallAudioIdentity() }.getOrNull() else null
                 if (foreground?.identity != identity) {
+                    if (foreground?.offer != null) log("CALL-AUDIO: phone call identity changed ${diagnosticStatus()}")
                     foreground?.closeOffer(token)
                     foreground = identity?.let { ForegroundCall(it, rate) }
                 }
                 val call = foreground
                 if (call == null) {
-                    if (inCall && !reportedUnavailable) {
-                        reportedUnavailable = true
-                        log("CALL-AUDIO: active cellular call identity unavailable; keep phone call route")
+                    if (inCall) {
+                        val reason = if (shellReady) diagnosticStatus() else "shizuku_unavailable"
+                        if (reportedUnavailable != reason) {
+                            reportedUnavailable = reason
+                            log("CALL-AUDIO: active cellular call identity unavailable $reason; keep phone call route")
+                        }
                     }
                 } else {
-                    reportedUnavailable = false
+                    reportedUnavailable = null
                     call.offer?.let { offer ->
                         val retry = RustCoreBridge.nativeTakeCallAudioRetry(token, offer)
                         if (retry != 0) {
+                            log("CALL-AUDIO: native requested retry=$retry ${diagnosticStatus()}")
+                            val identityBlockedStart = SpikeShell.callAudioOpenNeedsIdentity()
                             call.closeOffer(token)
-                            call.canOffer = call.rates.retry(retry)
+                            call.canOffer = if (identityBlockedStart) call.rates.retryIdentity() else call.rates.retry(retry)
                         }
                     }
                     if (call.canOffer && call.offer == null) {
@@ -79,7 +100,7 @@ internal object CarWithCallAudio {
                             val captureRate = call.rates.currentRate
                             if (captureRate == null) {
                                 call.canOffer = false
-                                log("CALL-AUDIO: phone audio endpoint unavailable")
+                                log("CALL-AUDIO: phone audio endpoint unavailable ${diagnosticStatus()}")
                                 break
                             }
                             val socket = try {
@@ -90,6 +111,7 @@ internal object CarWithCallAudio {
                                 break
                             }
                             if (socket == null) {
+                                if (SpikeShell.callAudioOpenNeedsIdentity()) break
                                 call.rates.advance()
                                 continue
                             }
@@ -97,6 +119,7 @@ internal object CarWithCallAudio {
                                 socket.use {
                                     if (armed() && RustCoreBridge.nativeOfferCallAudio(token, ++offerId, captureRate, it.detachFd())) {
                                         call.offer = offerId
+                                        log("CALL-AUDIO: phone audio offered rate=$captureRate")
                                     }
                                 }
                             } finally {
@@ -123,6 +146,8 @@ internal class CallAudioRates(preferred: Int) {
     val currentRate: Int? get() = rates.getOrNull(index)
 
     fun advance() { index++ }
+
+    fun retryIdentity(): Boolean = retry(RETRY_STREAM)
 
     fun retry(reason: Int): Boolean = when (reason) {
         RETRY_STREAM -> if (retriedStream) false else {

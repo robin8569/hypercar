@@ -5,8 +5,10 @@ import io.github.hypercar.net.CarNetworkReuse
 /** Entry lifecycle uses the attempt snapshot; wire protocol is negotiated separately in Rust. */
 internal object CarLifeSourcePolicy {
     // "carplus"（OPPO Car+ 车联）是本 fork 新增的 CarLife 源，与 carwith 同构：
-    // 自己建屏/编码并开本机七通道，只是拉起对象不同。
+    // 自己建屏/编码并开本机七通道，只是拉起对象不同；通话音频沿用 carwith 的默认开启。
     fun isGateway(source: String) = source == "carwith" || source == "carplus" || source == "system_carlife"
+    fun allowsCallAudio(source: String, systemCallAudio: Boolean) =
+        source == "carwith" || source == "carplus" || source == "system_carlife" && systemCallAudio
     fun shouldReopen(source: String, startup: Boolean) =
         source == "carwith" || source == "carplus" || source == "system_carlife" && startup
 
