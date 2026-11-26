@@ -10,6 +10,19 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VerifiedWifiWaitTest {
+    @Test fun associatedWifiCanWaitForLateAddressesWithinTheOriginalRequestDeadline() = runTest {
+        val budget = VerifiedWifiWait.addressBudget(30_000, associated = true)
+        val result = VerifiedWifiWait.await(budget, { testScheduler.currentTime }, { true }) {
+            "car-network".takeIf { testScheduler.currentTime >= 4_000 }
+        }
+        assertEquals("car-network", result)
+        assertEquals(4_000L, testScheduler.currentTime)
+        assertEquals(12_000L, budget)
+        assertEquals(2_500L, VerifiedWifiWait.addressBudget(2_500, associated = true))
+        assertEquals(3_000L, VerifiedWifiWait.addressBudget(30_000, associated = false))
+        assertEquals(0L, VerifiedWifiWait.addressBudget(-1, associated = true))
+    }
+
     @Test fun sameSsidPasswordChangeStopsAnOutstandingRequestBeforeItsSystemTimeout() = runTest {
         val request = CarWifiRequestIdentity("car", "old-passphrase")
         val association = WifiRequestAssociation<Any, String>()
@@ -20,17 +33,27 @@ class VerifiedWifiWaitTest {
             delay(250)
             newestPassword = "new-passphrase"
         }
-        val current = VerifiedWifiWait.awaitCallback(60_000, { testScheduler.currentTime },
+        val callback = VerifiedWifiWait.awaitCallback(60_000, { testScheduler.currentTime },
             credentialsCurrent = { !request.requiresCredentialUpdate("car", newestPassword) },
             poll = {
                 delay(it)
                 testScheduler.currentTime == 400L && association.available(old, "old-network")
             })
-        if (!current) association.release()
-        assertFalse(current)
+        assertEquals(VerifiedWifiWait.CallbackWait.SUPERSEDED, callback)
+        association.release()
         assertEquals(400L, testScheduler.currentTime)
         assertFalse(association.available(old, "late-old-network"))
         assertTrue(association.register(Any()))
+    }
+
+    @Test fun keepingAnActiveHintDoesNotExtendTheOverallDeadline() = runTest {
+        var checks = 0
+        val result = VerifiedWifiWait.awaitCallback(60_000, { testScheduler.currentTime },
+            credentialsCurrent = { true }, poll = { delay(it); false }, hintCheckMillis = 4_000,
+            keepHint = { checks++; true })
+        assertEquals(VerifiedWifiWait.CallbackWait.TIMEOUT, result)
+        assertEquals(1, checks)
+        assertEquals(60_000L, testScheduler.currentTime)
     }
 
     @Test fun unavailable_at_twenty_seconds_can_recover_a_later_verified_network() = runTest {

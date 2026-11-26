@@ -1599,6 +1599,7 @@ fun CarSourceSection(
                     "car_ui" to "自绘 UI",
                     "carwith" to "CarWith",
                     "carplus" to "Car+ 车联",
+                    "system_carlife" to "CarLife+",
                 )
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                     sources.forEachIndexed { index, (source, label) ->
@@ -1607,7 +1608,8 @@ fun CarSourceSection(
                             enabled = !connected && when (source) {
                                 "car_ui" -> startup.shizukuReady
                                 "carwith" -> startup.carWithInstalled
-                                else -> startup.carPlusInstalled
+                                "carplus" -> startup.carPlusInstalled
+                                else -> true
                             },
                             onClick = { selectSource(source) },
                             shape = SegmentedButtonDefaults.itemShape(index = index, count = sources.size),
@@ -1618,6 +1620,7 @@ fun CarSourceSection(
                 Spacer(Modifier.height(8.dp))
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
+                    current == "system_carlife" -> "在手机车联中打开 CarLife+ 的无线连接并开始连接，保持页面等待，HyperCar 会自动接入。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     current == "carplus" -> "Car+ 车联与 CarWith 共用同一套 CarLife 转发；入口按包名与 Activity 自动探测，细节见日志 CARPLUS 行。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
@@ -1626,6 +1629,7 @@ fun CarSourceSection(
                 if (current == "carwith" && startup.carWithInstalled) {
                     CarWithSettingsShortcut()
                 }
+                if (current == "system_carlife") SystemCarLifeSettingsShortcut(!connected)
                 if (!startup.carWithInstalled) {
                     Text("未安装系统 CarWith，CarWith 选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
@@ -1736,6 +1740,16 @@ fun CarSourceSection(
                 else "当前：${SettingsStore.carPlusComponent}",
                     color = TextSecondary, style = MaterialTheme.typography.labelSmall)
             }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            Text("手机 CarLife+", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text("使用三星车联、荣耀车联等手机自带的 CarLife+ 画面，无需小米 CarWith 或 Shizuku。请在手机车联中打开无线连接并开始连接，保持页面等待。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            CapsuleButton(if (current == "system_carlife") "已选择 CarLife+" else "选择 CarLife+",
+                onClick = { selectSource("system_carlife") }, enabled = !connected,
+                modifier = Modifier.fillMaxWidth(), filled = current == "system_carlife")
+            SystemCarLifeSettingsShortcut(!connected)
             if (!compact) {
                 Spacer(Modifier.height(8.dp))
                 Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
@@ -1743,6 +1757,16 @@ fun CarSourceSection(
             }
         }
     }
+}
+
+@Composable
+private fun SystemCarLifeSettingsShortcut(enabled: Boolean) {
+    val context=LocalContext.current
+    if (io.github.hypercar.session.StartupRequirements.systemCarLifePackage(context) == null) return
+    CapsuleButton("打开手机车联", onClick = {
+        if (!io.github.hypercar.session.StartupRequirements.openSystemCarLife(context))
+            android.widget.Toast.makeText(context,"请手动打开手机车联中的 CarLife+ 无线连接页",android.widget.Toast.LENGTH_LONG).show()
+    }, enabled = enabled, modifier = Modifier.fillMaxWidth())
 }
 
 @Composable

@@ -3,6 +3,8 @@
 import android.content.Context
 import android.content.SharedPreferences
 
+internal data class CarWithDisplay(val width: Int, val height: Int, val maxFps: Int? = null)
+
 /**
  * 设置仓库（SharedPreferences 落盘；UI 只依赖这里的默认值与键名）。
  * 与 UI 的契约：全部属性为 suspend-free 同步读，写入立即生效并广播 Flow。
@@ -277,18 +279,25 @@ object SettingsStore {
     @Volatile var receiverMaxFps: Int? = null
     @Volatile var receiverViewport: Pair<Int, Int>? = null
 
-    /** CarWith prewarm uses only this receiver's observed canvas, never custom UI size. */
-    fun carWithCanvas(receiver: String?): Pair<Int, Int>? {
+    /** CarWith prewarm uses the last display declaration of this receiver. */
+    internal fun carWithDisplay(receiver: String?): CarWithDisplay? {
         if (receiver.isNullOrBlank()) return null
-        val width = p().getInt("carwith_canvas_width_$receiver", 0)
-        val height = p().getInt("carwith_canvas_height_$receiver", 0)
-        return (width to height).takeIf { width in 2..8192 && height in 2..8192 }
+        val values = p().all
+        val width = values["carwith_canvas_width_$receiver"] as? Int ?: return null
+        val height = values["carwith_canvas_height_$receiver"] as? Int ?: return null
+        if (width !in 2..8192 || height !in 2..8192) return null
+        val maxFps = (values["carwith_canvas_max_fps_$receiver"] as? Int)?.takeIf { it > 0 }
+        return CarWithDisplay(width, height, maxFps)
     }
 
-    fun rememberCarWithCanvas(receiver: String?, width: Int, height: Int) {
-        if (receiver.isNullOrBlank() || width !in 2..8192 || height !in 2..8192) return
-        p().edit().putInt("carwith_canvas_width_$receiver", width)
-            .putInt("carwith_canvas_height_$receiver", height).apply()
+    internal fun rememberCarWithDisplay(receiver: String, width: Int, height: Int, maxFps: Int?) {
+        if (receiver.isBlank() || width !in 2..8192 || height !in 2..8192) return
+        val fpsKey = "carwith_canvas_max_fps_$receiver"
+        val edit = p().edit()
+            .putInt("carwith_canvas_width_$receiver", width)
+            .putInt("carwith_canvas_height_$receiver", height)
+        if (maxFps != null && maxFps > 0) edit.putInt(fpsKey, maxFps) else edit.remove(fpsKey)
+        edit.apply()
     }
 
     val encodingPlan: VideoEncodingPlan
@@ -309,6 +318,7 @@ object SettingsStore {
      *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
      *  · "carplus"  —— 走 OPPO Car+ 车联（2026-11-23）：同样是 CarLife 手机端，自己建屏/编码
      *                 并开本机七通道，区别只在拉起谁的入口；协议层与 CarWith 完全共用
+     *  · "system_carlife" —— 手机 CarLife+（三星/荣耀等），用户开启无线连接后接入本地引擎
      */
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
@@ -317,11 +327,17 @@ object SettingsStore {
     /** Existing explicit choices survive upgrades; fresh installs must choose a source. */
     val carSourceSelected: Boolean get() = p().contains("car_source")
 
-    /** 是否走本机 CarLife 桥（CarWith 与 Car+ 车联共用同一套七通道桥）。 */
-    val carWithMode: Boolean get() = carSource == "carwith" || carSource == "carplus"
+    /** 是否 CarWith 模式。 */
+    val carWithMode: Boolean get() = carSource == "carwith"
 
-    /** 是否 OPPO Car+ 车联源。 */
+    /** 是否手机自带 CarLife+ 源。 */
+    val systemCarLifeMode: Boolean get() = carSource == "system_carlife"
+
+    /** 是否 OPPO Car+ 车联源（Car+ 车联与 CarWith 共用同一套七通道桥）。 */
     val carPlusMode: Boolean get() = carSource == "carplus"
+
+    /** 是否走本机 CarLife 桥（CarWith / Car+ 车联 / 手机 CarLife+）。 */
+    val carLifeMode: Boolean get() = io.github.hypercar.session.CarLifeSourcePolicy.isGateway(carSource)
 
     /**
      * Car+ 车联入口组件覆盖（`包名/Activity`）；空 = 按包名候选 + Activity 关键字自动探测。
@@ -407,9 +423,10 @@ object SettingsStore {
         width: Int = videoWidth,
         height: Int = videoHeight,
         receiverBluetoothMac: String? = null,
-        carWithSource: Boolean = carWithMode,
+        carWithSource: Boolean = carLifeMode,
         receiverModel: String? = null,
         headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile,
+        systemCarLifeSource: Boolean = systemCarLifeMode,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
@@ -442,6 +459,14 @@ object SettingsStore {
             }
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
+            append("\"system_carlife_source\":").append(carWithSource && systemCarLifeSource).append(",")
+            if (carWithSource && systemCarLifeSource) {
+                io.github.hypercar.session.CarLifeSourcePolicy.huIdentity(receiverBluetoothMac,targetCarMac,targetCarName,pairedCars)?.let { hu ->
+                    append("\"hu_bt_address\":").append(org.json.JSONObject.quote(hu.address)).append(",")
+                    append("\"hu_bt_name\":").append(org.json.JSONObject.quote(hu.name)).append(",")
+                    append("\"hu_manufacturer\":\"HyperCar\",\"hu_model\":\"HyperCar HU\",")
+                }
+            }
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
             append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
@@ -452,12 +477,14 @@ object SettingsStore {
             append("\"touch_display_w\":").append(tdW).append(",")
             append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(plan.fps).append(",")
-            append("\"enable_audio\":true,")
-            append("\"carwith_microphone\":").append(carWithSource).append(",")
+            append("\"enable_audio\":").append(profile.airplayAudioEnabled).append(",")
+            // Public CarLife+ keeps its phone microphone, as in the reference.
+            // The existing Xiaomi car-microphone bridge remains unchanged.
+            append("\"carwith_microphone\":").append(profile.airplayAudioEnabled && carWithSource && !systemCarLifeSource).append(",")
             append("\"video_codec\":\"").append(VideoCodecPolicy.forHardware(videoCodec, VideoHardwareCapabilities.hevcEncoderAvailable)).append("\",")
             append("\"bmw_capabilities\":").append(profile.protocolProfileId.startsWith("bmw_")).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
-            append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
+            append("\"self_microphone_asr\":").append(profile.airplayAudioEnabled && carVoiceRecognition && !carWithSource).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"request_receiver_stats\":").append(debugLogEnabled).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
