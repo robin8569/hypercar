@@ -120,7 +120,10 @@ jobs:
           git config user.name "hypercar-sync"
           git config user.email "sync@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          git fetch upstream main --tags
+          # 只取上游分支，**绝不带 --tags**：上游与本仓库的同名 tag（v0.1.0.x）指向不同提交，
+          # `git fetch --tags` 会报 "would clobber existing tag" 并以非零退出码失败，
+          # 合并根本没机会开始。合并只需要分支内容，tag 由 android-ci 发布时自己创建。
+          git fetch upstream main
           if ! git merge --no-ff upstream/main \
               -m "sync(upstream): 合并上游 v${{ steps.cmp.outputs.upstream }}"; then
             echo "::warning::与上游 v${{ steps.cmp.outputs.upstream }} 存在冲突，已中止合并"
