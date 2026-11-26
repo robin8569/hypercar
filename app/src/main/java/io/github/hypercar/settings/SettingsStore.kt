@@ -318,10 +318,14 @@ object SettingsStore {
      *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
      *  · "carplus"  —— 走 OPPO Car+ 车联（2026-11-23）：同样是 CarLife 手机端，自己建屏/编码
      *                 并开本机七通道，区别只在拉起谁的入口；协议层与 CarWith 完全共用
-     *  · "system_carlife" —— 手机 CarLife+（三星/荣耀等），用户开启无线连接后接入本地引擎
+     *
+     * 本 fork 不提供上游的 "system_carlife"（三星/荣耀等手机自带 CarLife+）这一选项：
+     * 该槽位直接由 Car+ 车联取代，旧版本存过 system_carlife 的设备读取时迁到 carplus。
      */
     var carSource: String
-        get() = p().getString("car_source", "car_ui") ?: "car_ui"
+        get() = p().getString("car_source", "car_ui")?.takeIf { it.isNotBlank() }?.let {
+            if (it == "system_carlife") "carplus" else it
+        } ?: "car_ui"
         set(v) = p().edit().putString("car_source", v).apply()
 
     /** Existing explicit choices survive upgrades; fresh installs must choose a source. */
