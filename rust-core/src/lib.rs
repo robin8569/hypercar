@@ -22,6 +22,7 @@ mod speech_resource;
 mod aux_audio;
 mod aux_setup;
 mod mic_probe;
+mod call_aac_eld;
 mod call_audio;
 mod audio_resource;
 mod bplist;
@@ -98,10 +99,10 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeOfferCa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioRetry(
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioResult(
     _env: JNIEnv, _class: JClass, token: jlong, attempt: jlong,
 ) -> jint {
-    call_audio::take_retry_reason(token, attempt) as jint
+    call_audio::take_result(token, attempt) as jint
 }
 
 static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
